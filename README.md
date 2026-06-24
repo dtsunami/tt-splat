@@ -1,13 +1,14 @@
 # tt-splat
 
-3D Gaussian Splatting **training** on Tenstorrent Blackhole — the TT backend for the `arcgs` pipeline.
+3D Gaussian Splatting **training** on Tenstorrent Blackhole — a self-contained pipeline with a browser
+training dashboard (the `ttgs` CLI). Jump to [Install](#install) · [Quickstart](#quickstart).
 
 - **[`docs/PROGRESS.md`](docs/PROGRESS.md) — START HERE: full milestone log (M0–M15), architecture,
   findings, and status.** Every algorithmic stage is proven on real Blackhole silicon or the right target.
 - [`docs/ALGORITHM.md`](docs/ALGORITHM.md) + `algorithm.svg` — the pipeline map, annotated with current state.
 - [`FEASIBILITY.md`](FEASIBILITY.md) — hardware/stack feasibility: pipeline→BH mapping, the walls
   (sort, **cross-core float scatter-add**, per-pixel alpha-blend), assets, and the path forward.
-- [`pathclear/`](pathclear/) — minimal proven flows on real silicon, de-risking the machinery before
+- [`docs/pathclear/`](docs/pathclear/) — minimal proven flows on real silicon, de-risking the machinery before
   the hard kernels.
   - `gaussian_fit.py` — **M0 (validated):** 1D Gaussian fit, on-device fp32 forward (SFPU `exp`) + Adam. `PATHCLEAR_OK`.
   - `gaussian2d_image.py` — **M1 (validated):** 2D anisotropic Gaussian → image fit via the conic (Σ⁻¹); per-pixel
@@ -62,43 +63,80 @@
     `--preview`. `--selftest` → `REAL_PIPE_OK` (SH train 50.9 dB; mask weighting machine-exact Δ=0).
 - [`docs/`](docs/) — [`ALGORITHM.md`](docs/ALGORITHM.md) + `algorithm.svg`: the full training loop annotated with current state.
 
-## Run
+## Install
+
+tt-splat installs into the **tt-metal `python_env`** venv — the one built by tt-metal's `./create_venv.sh`,
+which already has `torch` + `ttnn` (and everything else the Blackhole path needs, so this installs nothing
+extra and never touches the tt-metal torch build). The venv uses **`uv pip`**:
 
 ```bash
-export TT_METAL_HOME=~/tt-metal TT_METAL_RUNTIME_ROOT=~/tt-metal
-~/tt-metal/python_env/bin/python docs/pathclear/gaussian_fit.py
-```
-
-**ttgs dashboard on Blackhole** ([`server/`](server/)) — uses tt-splat's vendored `ttgs` FastAPI dashboard
-([`ttgs/`](ttgs/), forked from arcgs; fully self-contained, no external deps), routing the training stage to the
-TT pipeline. No `PYTHONPATH` needed — the script puts the repo root on `sys.path` itself:
-```bash
+git clone https://github.com/dtsunami/tt-splat.git ~/tt-splat
 cd ~/tt-splat
-~/tt-metal/python_env/bin/python \
-  server/serve_blackhole.py --dataset work/scene --output work/tt_out   # → http://localhost:7860/training
+VIRTUAL_ENV=~/tt-metal/python_env uv pip install -e .   # registers the `ttgs` CLI
+cp .env.example .env                                    # then edit TT_METAL_HOME etc.
 ```
-`server/train_tt.py` is a drop-in `ttgs` training stage (full `TrainingController` contract: live Render|GT|metrics,
-prune/densify/clamp/pause commands; **SH color** from `cfg.sh_degree` + **per-image masks** from frames.json; writes
-standard 3DGS `splat.ply` — deg-3 = 3 f_dc + 45 f_rest). Verified in-process (all endpoints 200) + driving a real
-controller on the corgi data. NOTE: comfy runs a live SDXL server on the device (board p150) — don't kill
-`/proc/driver/tenstorrent/0/pids` blindly; the probe avoids `import ttnn` to not contend.
 
-**Train on your own data** (pycolmap installed in the venv; ffmpeg only for video):
+The `ttgs` command lands at `~/tt-metal/python_env/bin/ttgs`. Put that dir on `PATH`, or prefix it explicitly
+(`~/tt-metal/python_env/bin/ttgs …`). All examples below assume `ttgs` is on `PATH`.
+
+> The optional host gsplat reference path (`ttgs train`/`run`) + viser viewer (`ttgs view`) need extra deps:
+> `VIRTUAL_ENV=~/tt-metal/python_env uv pip install -e '.[reference]'`. **Not needed for `ttgs blackhole`** —
+> and `gsplat` may pull a different `torch`, so prefer a separate venv for it.
+
+`.env` is loaded automatically on every run (it walks up from the current directory). See
+[`.env.example`](.env.example) for every variable; the key ones are `TT_METAL_HOME` / `TT_METAL_RUNTIME_ROOT`
+(your tt-metal tree) and the host-render budget knobs `TT_MAX_POINTS` / `TT_SIZE`.
+
+## Quickstart
+
 ```bash
-PY=~/tt-metal/python_env/bin/python
-# images (no sudo): prefer this for a bad video
-$PY docs/pathclear/prepare_data.py --images /path/to/photos --out runs/scene
-$PY docs/pathclear/train_real.py  --model runs/scene/sparse/0 --images /path/to/photos --size 96 --preview out.png
-# OR video (needs: sudo apt install ffmpeg):
-$PY docs/pathclear/prepare_data.py --video clip.mp4 --out runs/scene --every 10
+# 1. Verify the box: tt-smi on PATH, /dev/tenstorrent/0 present, TT_METAL_HOME set, ttnn importable
+ttgs info
+
+# 2. Train on the bundled sample scene (the corgi capture in work/scene)
+ttgs blackhole work/scene                           # → open http://localhost:7860/training
+
+# 3. Train on your own data
+ttgs blackhole /path/to/your/colmap-dataset --output work/my_out --steps 4000
 ```
 
-Canonical env = the `~/tt-metal` tree built at `v0.74-dev` with its `python_env` venv (`./create_venv.sh`,
-includes torch + ttnn). Custom kernels (`generic_op`) need a one-time symlink that the JIT include path omits on
-Blackhole: `ln -sf api/dataflow/dataflow_api.h ~/tt-metal/tt_metal/hw/inc/dataflow_api.h`.
+`ttgs info` prints a **Tenstorrent Blackhole** panel (device + driver + runtime checks) — run it first; every
+row should be green before you train. `ttgs setup` prints the full dependency guide.
 
-Single-owner device: if open fails with TLB/hugepage errors, kill whatever holds `/dev/tenstorrent/0`
-(`/proc/driver/tenstorrent/0/pids`).
+**CLI entry points** (`ttgs --help` for all):
+
+| command | purpose |
+|---|---|
+| `ttgs info` | system + Blackhole device status (run this first) |
+| `ttgs setup` | dependency / install guide |
+| `ttgs blackhole <dataset>` | **the main run** — TT training dashboard (Render\|GT\|Diff, prune/densify/clamp, live metrics) |
+| `ttgs sfm` / `ttgs extract` | data prep (COLMAP poses / video→frames) for your own captures |
+| `ttgs view <splat.ply>` | open a finished `.ply` in the viser viewer |
+
+**Bring your own capture** (COLMAP via `ttgs sfm`, or the pathclear helper):
+```bash
+ttgs extract clip.mp4 --output runs/scene/frames     # video → frames (needs ffmpeg)
+ttgs sfm runs/scene/frames --output runs/scene        # frames → COLMAP poses + sparse points (needs colmap)
+ttgs blackhole runs/scene
+```
+
+### Under the hood / advanced
+
+`ttgs blackhole` is a thin wrapper over [`server/serve_blackhole.py`](server/serve_blackhole.py), which stands up
+the vendored `ttgs` FastAPI dashboard ([`ttgs/`](ttgs/), forked from arcgs; self-contained, no `PYTHONPATH` needed)
+and routes the training stage to [`server/train_tt.py`](server/train_tt.py) — a drop-in `ttgs` training stage
+(full `TrainingController` contract; **SH color** from `cfg.sh_degree` + **per-image masks** from frames.json;
+writes standard 3DGS `splat.ply` — deg-3 = 3 f_dc + 45 f_rest).
+
+Canonical env = the `~/tt-metal` tree (`v0.74-dev`) with its `python_env` venv. Custom kernels (`generic_op`)
+need a one-time symlink the JIT include path omits on Blackhole:
+`ln -sf api/dataflow/dataflow_api.h ~/tt-metal/tt_metal/hw/inc/dataflow_api.h`.
+
+**Single-owner device:** if open fails with TLB/hugepage errors, kill whatever holds `/dev/tenstorrent/0`
+(`/proc/driver/tenstorrent/0/pids`). NOTE on this host: comfy runs a live SDXL server on board p150 — the probe
+avoids `import ttnn` so it won't contend; don't kill those PIDs blindly. Recover a wedged card with `tt-smi -r 0`.
+
+The raw milestone scripts run directly too, e.g. `~/tt-metal/python_env/bin/python docs/pathclear/gaussian_fit.py`.
 
 ## Status
 

@@ -21,37 +21,11 @@ try:
 except ImportError:
     _env_file = None
 
-# If ONEAPI_ROOT is set, source setvars.bat and inject the resulting env vars
-# into this process — so XPU just works without manual terminal setup.
-def _source_oneapi() -> str | None:
-    """Run setvars.bat and pull its exports into os.environ. Returns status string."""
-    import os, subprocess
-    root = os.environ.get("ONEAPI_ROOT")
-    if not root:
-        return None
-    setvars = Path(root) / "setvars.bat"
-    if not setvars.exists():
-        return f"ONEAPI_ROOT set to {root!r} but setvars.bat not found there"
-    try:
-        result = subprocess.run(
-            ["cmd", "/c", f'"{setvars}" quiet & set'],
-            capture_output=True, text=True, timeout=30,
-        )
-        for line in result.stdout.splitlines():
-            key, sep, val = line.partition("=")
-            if sep:
-                os.environ[key.strip()] = val.strip()
-        return str(setvars)
-    except Exception as exc:
-        return f"failed to source setvars.bat: {exc}"
-
-_oneapi_status: str | None = _source_oneapi()
-
 from ttgs import __version__
 
 app = typer.Typer(
     name="ttgs",
-    help="Open-source Gaussian Splatting pipeline for Intel Arc and NVIDIA GPUs.",
+    help="Gaussian Splatting pipeline for Tenstorrent Blackhole (tt-splat).",
     add_completion=False,
     rich_markup_mode="rich",
 )
@@ -62,7 +36,8 @@ console = Console()
 _device_opt = typer.Option(
     None,
     "--device", "-d",
-    help="Compute backend: xpu | cuda | directml | cpu  (auto-detected if omitted)",
+    help="Compute backend: cuda | cpu  (auto-detected if omitted). The Blackhole "
+         "path runs via [bold]ttgs blackhole[/].",
     metavar="BACKEND",
 )
 _config_opt = typer.Option(
@@ -359,12 +334,51 @@ def view(
         raise typer.Exit(1)
 
 
+# ─── blackhole ───────────────────────────────────────────────────────────────
+
+@app.command()
+def blackhole(
+    dataset: Path = typer.Argument(..., help="COLMAP dataset dir (sparse/0 + images/)"),
+    output: Path = typer.Option(Path("work/tt_out"), "--output", "-o",
+                                help="Output directory", metavar="DIR"),
+    port: int = typer.Option(7860, "--port", "-p", help="Dashboard server port"),
+    steps: int = typer.Option(2000, "--steps", help="Training iterations"),
+) -> None:
+    """[bold]Train on Tenstorrent Blackhole[/] — the ttgs dashboard driving the TT pipeline.
+
+    Stands up the FastAPI training dashboard (Render|GT|Diff, prune/densify/clamp,
+    pause/stop, live metrics) and routes the training stage to the tt-splat Blackhole
+    backend. Honors the TT_MAX_POINTS / TT_SIZE env knobs (set them in .env).
+
+    Examples:
+
+      ttgs blackhole work/scene
+      ttgs blackhole work/scene --output work/tt_out --port 7860 --steps 2000
+
+    Then open [bold]http://localhost:7860/training[/]
+    """
+    import subprocess
+    repo = Path(__file__).resolve().parent.parent
+    script = repo / "server" / "serve_blackhole.py"
+    if not script.exists():
+        console.print(f"[bold red]error:[/] {script} not found — "
+                      "run from a tt-splat checkout (pip install -e .).")
+        raise typer.Exit(1)
+    if not dataset.exists():
+        console.print(f"[bold red]error:[/] dataset not found: {dataset}")
+        raise typer.Exit(1)
+    cmd = [sys.executable, str(script), "--dataset", str(dataset),
+           "--output", str(output), "--port", str(port), "--steps", str(steps)]
+    console.print(f"[dim]→ {' '.join(cmd)}[/]")
+    raise typer.Exit(subprocess.call(cmd))
+
+
 # ─── info ────────────────────────────────────────────────────────────────────
 
 @app.command()
 def info() -> None:
-    """Show system info: detected backends, tool availability, gsplat status."""
-    import os
+    """Show system info: Blackhole device status, backends, tools, gsplat."""
+    import os, shutil, importlib.util
     from ttgs.backend.detect import probe_all, Backend
 
     console.print(f"\n[bold]ttgs v{__version__}[/]  Python {sys.version.split()[0]}\n")
@@ -373,12 +387,25 @@ def info() -> None:
     if _env_file:
         console.print(f"[dim].env:[/] {_env_file}")
     else:
-        console.print("[yellow].env not found[/] — create one from [bold].env.example[/] to configure tool paths")
-    if _oneapi_status:
-        if "failed" in _oneapi_status or "not found" in _oneapi_status:
-            console.print(f"[yellow]oneAPI:[/] {_oneapi_status}")
-        else:
-            console.print(f"[dim]oneAPI:[/] sourced {_oneapi_status}")
+        console.print("[yellow].env not found[/] — copy [bold].env.example[/] → [bold].env[/] to configure paths")
+    console.print()
+
+    # Tenstorrent Blackhole status — what a new user checks first
+    tt = Table(title="Tenstorrent Blackhole", show_header=True, header_style="bold cyan")
+    tt.add_column("Check", style="bold")
+    tt.add_column("Status")
+    ttsmi = shutil.which("tt-smi")
+    tt.add_row("tt-smi (PATH)", f"[green]{ttsmi}[/]" if ttsmi else "[red]not found[/] — install tenstorrent-tools")
+    tt.add_row("/dev/tenstorrent/0",
+               "[green]present[/]" if os.path.exists("/dev/tenstorrent/0") else "[red]absent[/] — is the card seated / driver loaded?")
+    tmh = os.environ.get("TT_METAL_HOME", "")
+    tt.add_row("TT_METAL_HOME",
+               f"[green]{tmh}[/]" if tmh and os.path.isdir(tmh)
+               else (f"[yellow]{tmh} (dir missing)[/]" if tmh else "[red]unset[/] — set in .env"))
+    have_ttnn = importlib.util.find_spec("ttnn") is not None
+    tt.add_row("ttnn (import)",
+               "[green]installed[/]" if have_ttnn else "[yellow]not installed[/] — host-reference loop only")
+    console.print(tt)
     console.print()
 
     # gsplat status
@@ -387,13 +414,13 @@ def info() -> None:
         gsplat_ver = getattr(gsplat, "__version__", "unknown")
         try:
             from gsplat import rasterization  # noqa: F401
-            console.print(f"[dim]gsplat:[/] v{gsplat_ver} [green]ready[/]")
+            console.print(f"[dim]gsplat:[/] v{gsplat_ver} [green]ready[/] (optional CPU/CUDA reference path)")
         except Exception as exc:
             console.print(f"[yellow]gsplat:[/] v{gsplat_ver} — rasterization import failed: {exc}")
     except ImportError:
         console.print(
-            "[red]gsplat not installed[/] — training will fail. "
-            "Install: [bold]pip install gsplat[/]"
+            r"[dim]gsplat:[/] not installed — fine for [bold]ttgs blackhole[/]. "
+            r"Only the optional host reference path (ttgs train) needs it: [bold]uv pip install -e '.\[reference]'[/]"
         )
     console.print()
 
@@ -442,27 +469,24 @@ def info() -> None:
 def setup() -> None:
     """Print setup instructions for all backends and external tools."""
     console.print("""
-[bold cyan]ttgs setup guide[/]
+[bold cyan]ttgs setup guide (Tenstorrent Blackhole)[/]
 
-[bold]1. ffmpeg[/] (frame extraction)
-   Windows: https://ffmpeg.org/download.html  or  winget install ffmpeg
-   Linux:   sudo apt install ffmpeg
+[bold]1. Tenstorrent stack[/] (device + runtime)
+   - Driver + tt-smi: install the tenstorrent-tools package; check with [bold]tt-smi[/].
+   - tt-metal: build the ~/tt-metal tree and its python_env (./create_venv.sh — brings
+     torch + ttnn). Point [bold]TT_METAL_HOME[/] / [bold]TT_METAL_RUNTIME_ROOT[/] at it in .env.
+   - Recover a wedged card with [bold]tt-smi -r 0[/].
 
-[bold]2. COLMAP[/] (structure from motion)
-   Windows: https://github.com/colmap/colmap/releases  (portable .zip, set COLMAP_PATH in .env)
-   Linux:   sudo apt install colmap
+[bold]2. ffmpeg[/] (frame extraction from video — optional)
+   Linux: sudo apt install ffmpeg     (or set FFMPEG_PATH / FFPROBE_PATH in .env)
 
-[bold]3. gsplat[/] (3DGS training — pure Python, no binary needed)
-   pip install gsplat
+[bold]3. COLMAP[/] (structure from motion — camera poses + sparse points)
+   Linux: sudo apt install colmap     (or set COLMAP_PATH in .env)
 
-   gsplat auto-detects the best available backend (XPU → CUDA → CPU).
-   For Intel Arc XPU, make sure PyTorch was installed from the XPU index:
-     pip install torch --index-url https://download.pytorch.org/whl/xpu
+[bold]4. Install ttgs[/]
+   pip install -e .                    (registers the `ttgs` command)
 
-[bold]4. Python / PyTorch[/]
-
-   Intel Arc XPU (install from the XPU index — plain PyPI gives a CPU-only build):
-     pip install torch --index-url https://download.pytorch.org/whl/xpu
+Then verify everything with [bold]ttgs info[/] and run [bold]ttgs blackhole work/scene[/].
 """)
 
 

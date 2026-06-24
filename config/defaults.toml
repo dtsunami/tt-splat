@@ -1,5 +1,5 @@
 # ttgs default configuration
-# Override any value via --config my.toml or environment variables TTGS_*
+# Override any value by passing a TOML file:  ttgs <cmd> --config my.toml
 
 [extract]
 # Target frames-per-second to sample from video.

@@ -4,6 +4,9 @@
 *.egg-info/
 .venv/
 
+# Local env config (holds machine-specific paths) — keep .env.example tracked
+.env
+
 # Build / generated artifacts
 build/
 generated/
