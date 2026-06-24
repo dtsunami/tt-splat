@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-arcgs training stage for the TENSTORRENT/BLACKHOLE backend.
+ttgs training stage for the TENSTORRENT/BLACKHOLE backend.
 
-Drop-in for arcgs.stages.train.run — same signature + same TrainingController contract,
-so the existing arcgs FastAPI dashboard (Render|GT|Diff, prune/densify/clamp controls,
+Drop-in for ttgs.stages.train.run — same signature + same TrainingController contract,
+so the existing ttgs FastAPI dashboard (Render|GT|Diff, prune/densify/clamp controls,
 pause/stop, live metrics) drives our tt-splat pipeline unchanged.
 
 v1 runs the host-reference render+optimize (the verified tt-splat math; device kernels —
 SFPU blend-loop M5, scatter-add M2 — are validated separately and slot in as the perf path).
 Loads the COLMAP model via pycolmap (binary or text), inits Gaussians from sparse points,
-writes a standard 3DGS splat.ply that arcgs export/view consume.
+writes a standard 3DGS splat.ply that ttgs export/view consume.
 """
 from __future__ import annotations
 import sys, math, os
@@ -18,10 +18,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pathclear"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "docs" / "pathclear"))
 from train_real import (project_general, render, init_from_points, load_image, load_mask,
                          tensors, sh_dim, C0)  # verified SH render + masks
-from arcgs.viewer.dashboard import build_update
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # vendored ttgs package
+from ttgs.viewer.dashboard import build_update
 
 HOST_MAX_POINTS = int(os.environ.get("TT_MAX_POINTS", "1200"))   # host-render budget
 HOST_SIZE = int(os.environ.get("TT_SIZE", "96"))
@@ -168,8 +169,8 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
 
 if __name__ == "__main__":
     import argparse
-    from arcgs.config import TrainConfig
-    from arcgs.viewer.dashboard import TrainingController
+    from ttgs.config import TrainConfig
+    from ttgs.viewer.dashboard import TrainingController
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True); ap.add_argument("--output", default="work/tt_out")
     ap.add_argument("--steps", type=int, default=40)

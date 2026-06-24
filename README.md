@@ -66,16 +66,18 @@
 
 ```bash
 export TT_METAL_HOME=~/tt-metal TT_METAL_RUNTIME_ROOT=~/tt-metal
-~/tt-metal/python_env/bin/python pathclear/gaussian_fit.py
+~/tt-metal/python_env/bin/python docs/pathclear/gaussian_fit.py
 ```
 
-**arcgs dashboard on Blackhole** ([`server/`](server/)) — reuses the arcgs FastAPI dashboard (imported as a
-library; `~/arcgs` untouched), routing the training stage to the TT pipeline:
+**ttgs dashboard on Blackhole** ([`server/`](server/)) — uses tt-splat's vendored `ttgs` FastAPI dashboard
+([`ttgs/`](ttgs/), forked from arcgs; fully self-contained, no external deps), routing the training stage to the
+TT pipeline. No `PYTHONPATH` needed — the script puts the repo root on `sys.path` itself:
 ```bash
-PYTHONPATH=/home/starboy/arcgs ~/tt-metal/python_env/bin/python \
+cd ~/tt-splat
+~/tt-metal/python_env/bin/python \
   server/serve_blackhole.py --dataset work/scene --output work/tt_out   # → http://localhost:7860/training
 ```
-`server/train_tt.py` is a drop-in arcgs training stage (full `TrainingController` contract: live Render|GT|metrics,
+`server/train_tt.py` is a drop-in `ttgs` training stage (full `TrainingController` contract: live Render|GT|metrics,
 prune/densify/clamp/pause commands; **SH color** from `cfg.sh_degree` + **per-image masks** from frames.json; writes
 standard 3DGS `splat.ply` — deg-3 = 3 f_dc + 45 f_rest). Verified in-process (all endpoints 200) + driving a real
 controller on the corgi data. NOTE: comfy runs a live SDXL server on the device (board p150) — don't kill
@@ -85,10 +87,10 @@ controller on the corgi data. NOTE: comfy runs a live SDXL server on the device 
 ```bash
 PY=~/tt-metal/python_env/bin/python
 # images (no sudo): prefer this for a bad video
-$PY pathclear/prepare_data.py --images /path/to/photos --out runs/scene
-$PY pathclear/train_real.py  --model runs/scene/sparse/0 --images /path/to/photos --size 96 --preview out.png
+$PY docs/pathclear/prepare_data.py --images /path/to/photos --out runs/scene
+$PY docs/pathclear/train_real.py  --model runs/scene/sparse/0 --images /path/to/photos --size 96 --preview out.png
 # OR video (needs: sudo apt install ffmpeg):
-$PY pathclear/prepare_data.py --video clip.mp4 --out runs/scene --every 10
+$PY docs/pathclear/prepare_data.py --video clip.mp4 --out runs/scene --every 10
 ```
 
 Canonical env = the `~/tt-metal` tree built at `v0.74-dev` with its `python_env` venv (`./create_venv.sh`,

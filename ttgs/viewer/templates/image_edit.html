@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ttgs — __IMAGE_NAME__</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/base.css">
+  <style>
+    #main { display: flex; flex: 1; overflow: hidden; }
+
+    /* ── toolbar ── */
+    #toolbar {
+      display: flex; align-items: center; gap: 8px;
+      padding: 8px 16px; background: #161616;
+      border-bottom: 1px solid #222; flex-shrink: 0;
+    }
+    .tgroup { display: flex; gap: 2px; }
+    .tgroup::after { content: ''; width: 1px; background: #333; margin: 0 6px; }
+    .tgroup:last-child::after { display: none; }
+    .tbtn {
+      padding: 6px 12px; background: #2a2a2a; border: 1px solid #3a3a3a;
+      color: #ccc; cursor: pointer; font-family: inherit; font-size: 13px;
+      border-radius: 4px; white-space: nowrap; min-height: 32px;
+    }
+    .tbtn:hover { background: #383838; color: #fff; }
+    .tbtn:focus-visible { outline: 2px solid #4af; outline-offset: 2px; }
+    .tbtn.on { background: #1a2a3a; border-color: #4af; color: #7cf; }
+    .tbtn.layer-on { background: #1a3a1a; border-color: #4a4; color: #8f8; }
+    .tslider { width: 80px; accent-color: #4af; vertical-align: middle; }
+    .tlabel { color: #999; font-size: 13px; }
+
+    /* ── layout ── */
+    #context {
+      width: 200px; flex-shrink: 0; background: #161616;
+      border-right: 1px solid #2a2a2a; overflow-y: auto;
+      scrollbar-width: thin; scrollbar-color: #333 transparent;
+    }
+    #canvas-area {
+      flex: 1; display: flex; flex-direction: column; overflow: hidden;
+    }
+    #canvas-wrap {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      position: relative; overflow: hidden; background: #0a0a0a;
+    }
+    #canvas-wrap > img {
+      max-width: 100%; max-height: 100%; object-fit: contain;
+      user-select: none; -webkit-user-drag: none;
+    }
+    #overlay-stack {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      pointer-events: none;
+    }
+    #overlay-stack.editing { pointer-events: auto; cursor: crosshair; }
+    #mask-canvas, #colmap-canvas, #poly-canvas { position: absolute; }
+    #mask-canvas  { opacity: 0.55; }
+    #colmap-canvas { opacity: 0.9; }
+    #poly-canvas  { opacity: 1; }
+
+    /* ── loss chart strip at bottom of canvas ── */
+    #chart-strip {
+      height: 120px; flex-shrink: 0; background: #0e0e0e;
+      border-top: 1px solid #222; position: relative;
+    }
+    #chart-strip .panel-label {
+      position: absolute; top: 4px; left: 10px; z-index: 1;
+      font-size: 10px; color: #555;
+    }
+
+    .poly-item {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 3px 6px; margin-bottom: 2px; background: #222; border-radius: 3px;
+      font-size: 11px; color: #aaa;
+    }
+    .poly-item .del { color: #f66; cursor: pointer; padding: 0 4px; }
+    .poly-item .del:hover { color: #f00; }
+
+    .nav-btn {
+      width: auto; display: inline-block; padding: 3px 10px;
+      background: #2a2a2a; border: 1px solid #3a3a3a; color: #bbb;
+      text-decoration: none; font-family: monospace; font-size: 12px; border-radius: 3px;
+    }
+    .nav-btn:hover { background: #333; color: #fff; text-decoration: none; }
+
+    /* ── edit mode indicator ── */
+    #edit-indicator {
+      display: none; padding: 2px 8px; background: #1a3a1a; border: 1px solid #4a4;
+      border-radius: 3px; color: #8f8; font-size: 10px; font-weight: bold;
+    }
+    #edit-indicator.on { display: inline-block; }
+
+    /* ── save flash indicator ── */
+    #save-flash {
+      position: fixed; top: 8px; right: 8px; z-index: 200;
+      padding: 6px 16px; border-radius: 4px;
+      font-family: monospace; font-size: 12px; font-weight: bold;
+      pointer-events: none; opacity: 0; transition: opacity .2s;
+    }
+    #save-flash.saving { opacity: 1; background: #2a3a2a; color: #8f8; border: 1px solid #4a4; }
+    #save-flash.saved  { opacity: 1; background: #1a3a1a; color: #4f4; border: 1px solid #4a4; }
+    #save-flash.error  { opacity: 1; background: #3a1a1a; color: #f88; border: 1px solid #a44; }
+  </style>
+</head>
+<body>
+
+<div id="save-flash"></div>
+<div class="topbar">
+  <a href="/"><b>ttgs</b></a> <span class="sep">|</span>
+  <a href="/images">images</a> <span class="sep">|</span>
+  <a href="/training">training</a> <span class="sep">|</span>
+  <b>__IMAGE_NAME__</b> <span class="sep">|</span>
+  <a class="nav-btn" id="btn-prev" href="#">Prev</a>
+  <a class="nav-btn" id="btn-next" href="#">Next</a>
+  <span class="spacer"></span>
+  <span class="small" id="mask-status" style="color:#888">--</span>
+  <span class="sep">|</span>
+  <span id="edit-indicator">EDITING</span>
+  <span class="poll-status" id="poll-status">--</span>
+</div>
+
+<!-- ── Training Header (shared component) ── -->
+<div class="run-bar" id="train-header"></div>
+
+<!-- ── Toolbar ── -->
+<div id="toolbar">
+  <!-- Tools -->
+  <div class="tgroup">
+    <button class="tbtn on" id="tb-poly" onclick="setTool('polygon')">Polygon <span class="tlabel">P</span></button>
+    <button class="tbtn" id="tb-brush" onclick="setTool('brush')">Brush <span class="tlabel">B</span></button>
+  </div>
+  <!-- Layers -->
+  <div class="tgroup">
+    <button class="tbtn layer-on" id="tb-fg" onclick="setLayer('fg')">Foreground</button>
+    <button class="tbtn" id="tb-wt" onclick="setLayer('weight')">Weight</button>
+    <button class="tbtn" id="tb-flt" onclick="setLayer('filter')">Filter</button>
+  </div>
+  <!-- Layer-specific controls (inline) -->
+  <div class="tgroup" id="ctrl-weight" style="display:none">
+    <span class="tlabel">w=</span>
+    <input type="range" class="tslider" id="weight-val" min="0" max="1" step="0.05" value="0.5"
+           oninput="document.getElementById('weight-disp').textContent=parseFloat(this.value).toFixed(2)">
+    <span class="tlabel" id="weight-disp">0.50</span>
+  </div>
+  <div class="tgroup" id="ctrl-filter" style="display:none">
+    <select id="filter-type" style="background:#2a2a2a;color:#ccc;border:1px solid #3a3a3a;font-family:monospace;font-size:11px;padding:2px">
+      <option value="gaussian_blur">Gaussian blur</option>
+      <option value="median">Median</option>
+      <option value="sharpen">Sharpen</option>
+      <option value="brightness">Brightness</option>
+    </select>
+    <span class="tlabel">r=</span>
+    <input type="range" class="tslider" id="filter-radius" min="1" max="40" value="15"
+           oninput="document.getElementById('filter-r-disp').textContent=this.value">
+    <span class="tlabel" id="filter-r-disp">15</span>
+  </div>
+  <div class="tgroup" id="ctrl-brush" style="display:none">
+    <span class="tlabel">size=</span>
+    <input type="range" class="tslider" id="brush-size" min="4" max="200" value="30"
+           oninput="document.getElementById('brush-disp').textContent=this.value">
+    <span class="tlabel" id="brush-disp">30</span>
+  </div>
+  <!-- Overlays -->
+  <div class="tgroup">
+    <button class="tbtn on" id="tb-ov-mask" onclick="toggleOverlay('mask')">Mask <span class="tlabel">M</span></button>
+    <button class="tbtn" id="tb-ov-colmap" onclick="toggleOverlay('colmap')">COLMAP <span class="tlabel">C</span></button>
+  </div>
+  <!-- Actions -->
+  <div class="tgroup">
+    <button class="tbtn on" onclick="toggleEdit()" id="tb-edit">Edit <span class="tlabel">E</span></button>
+    <button class="tbtn" onclick="saveMask()" style="color:#8f8">Save <span class="tlabel">^S</span></button>
+    <button class="tbtn" onclick="undoLast()">Undo <span class="tlabel">Z</span></button>
+  </div>
+</div>
+
+<div id="main">
+  <!-- ── Left pane: pipeline controls + preview + frames + regions ── -->
+  <div id="context">
+    <!-- Pipeline controls (shared component) -->
+    <div id="pipeline-controls"></div>
+
+    <!-- Frame list -->
+    <div class="ctrl-section">
+      <h3>Frames <span class="ctrl-tag" id="frame-count">--</span></h3>
+      <div class="fl-scroll" id="frame-list"></div>
+    </div>
+
+    <!-- Regions -->
+    <div class="ctrl-section">
+      <h3>Regions</h3>
+      <div id="poly-list"></div>
+    </div>
+  </div>
+
+  <!-- ── Canvas + chart ── -->
+  <div id="canvas-area">
+    <div id="canvas-wrap">
+      <img id="source-img" />
+      <div id="overlay-stack" class="editing">
+        <canvas id="mask-canvas"></canvas>
+        <canvas id="colmap-canvas"></canvas>
+        <canvas id="poly-canvas"></canvas>
+      </div>
+    </div>
+    <div id="chart-strip">
+      <div class="panel-label"><b>Loss</b>
+        <span class="muted small" style="cursor:pointer;margin-left:8px" onclick="toggleChartMode();" id="chart-mode-btn">all cameras</span>
+      </div>
+      <canvas id="loss-chart" width="800" height="120" style="width:100%;height:100%;background:#0e0e0e"></canvas>
+    </div>
+  </div>
+</div>
+
+<script src="/static/base.js"></script>
+<script src="/static/components.js"></script>
+<script>
+const IMAGE_NAME = '__IMAGE_NAME__';
+let allFrames = [], currentIdx = -1, isExcluded = false;
+
+const maskCanvas   = document.getElementById('mask-canvas');
+const maskCtx      = maskCanvas.getContext('2d');
+const colmapCanvas = document.getElementById('colmap-canvas');
+const colmapCtx    = colmapCanvas.getContext('2d');
+const polyCanvas   = document.getElementById('poly-canvas');
+const polyCtx      = polyCanvas.getContext('2d');
+
+// ── State ────────────────────────────────────────────────────────────────────
+let tool    = 'polygon';  // polygon | brush
+let layer   = 'fg';       // fg | weight | filter
+let editing = true;        // default ON — user lands ready to edit
+let painting = false;
+let _dirty  = false;       // unsaved local edits
+
+let polygons = [];   // fg keep regions
+let weights  = [];   // [{polygon, weight}]
+let filters  = [];   // [{polygon, type, radius/factor}]
+let activePts = [], cursorPos = null;
+const SNAP = 14;
+
+let overlays = {mask: true, colmap: false};
+let colmapData = null;
+
+// Undo
+let undoStack = [];
+function snap() { return {polygons: JSON.parse(JSON.stringify(polygons)), weights: JSON.parse(JSON.stringify(weights)), filters: JSON.parse(JSON.stringify(filters))}; }
+function pushUndo() { undoStack.push(snap()); if (undoStack.length > 30) undoStack.shift(); _dirty = true; }
+function undoLast() { if (!undoStack.length) return; const s = undoStack.pop(); polygons=s.polygons; weights=s.weights; filters=s.filters; activePts=[]; _dirty = true; renderAll(); autoSave(); }
+
+// ── Auto-save (debounced) ────────────────────────────────────────────────────
+let _autoSaveTimer = null;
+let _flashTimer = null;
+
+function showFlash(msg, cls) {
+  const el = document.getElementById('save-flash');
+  if (!el) return;
+  el.textContent = msg;
+  el.className = cls;
+  if (_flashTimer) clearTimeout(_flashTimer);
+  _flashTimer = setTimeout(() => { el.className = ''; }, 2000);
+}
+
+function autoSave() {
+  if (_autoSaveTimer) clearTimeout(_autoSaveTimer);
+  _autoSaveTimer = setTimeout(doAutoSave, 300);
+  // Immediate visual feedback: status bar updates
+  document.getElementById('mask-status').textContent = polygons.length+'fg '+weights.length+'w '+filters.length+'f *';
+  document.getElementById('mask-status').style.color = '#fa0';
+}
+
+async function doAutoSave() {
+  _autoSaveTimer = null;
+  showFlash('saving...', 'saving');
+  const payload = JSON.stringify({polygons, weights, filters});
+  console.log('[ttgs] auto-saving', payload.length, 'bytes for', IMAGE_NAME);
+  try {
+    const resp = await fetch('/images/'+IMAGE_NAME+'/mask-data', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: payload,
+    });
+    if (!resp.ok) {
+      let detail = 'HTTP ' + resp.status;
+      try { const err = await resp.json(); detail += ': ' + JSON.stringify(err); } catch(_){}
+      console.error('[ttgs] save response:', detail);
+      throw new Error(detail);
+    }
+    _dirty = false;
+    _lastSavedHash = JSON.stringify({polygons, weights, filters});
+    const summary = polygons.length+'fg '+weights.length+'w '+filters.length+'f';
+    document.getElementById('mask-status').textContent = summary + ' (saved)';
+    document.getElementById('mask-status').style.color = '#8f8';
+    showFlash('saved ' + summary, 'saved');
+    console.log('[ttgs] auto-saved mask data for', IMAGE_NAME, summary);
+  } catch(e) {
+    document.getElementById('mask-status').textContent = 'SAVE FAILED';
+    document.getElementById('mask-status').style.color = '#f44';
+    showFlash('save failed: ' + e.message, 'error');
+    console.error('[ttgs] auto-save failed:', e);
+  }
+}
+
+// ── Tool / layer / overlay switching ─────────────────────────────────────────
+function setTool(t) {
+  tool = t; cancelActive();
+  document.getElementById('tb-poly').className  = t==='polygon' ? 'tbtn on' : 'tbtn';
+  document.getElementById('tb-brush').className = t==='brush' ? 'tbtn on' : 'tbtn';
+  document.getElementById('ctrl-brush').style.display = t==='brush' ? 'flex' : 'none';
+}
+function setLayer(l) {
+  layer = l; cancelActive();
+  document.getElementById('tb-fg').className  = l==='fg' ? 'tbtn layer-on' : 'tbtn';
+  document.getElementById('tb-wt').className  = l==='weight' ? 'tbtn layer-on' : 'tbtn';
+  document.getElementById('tb-flt').className = l==='filter' ? 'tbtn layer-on' : 'tbtn';
+  document.getElementById('ctrl-weight').style.display = l==='weight' ? 'flex' : 'none';
+  document.getElementById('ctrl-filter').style.display = l==='filter' ? 'flex' : 'none';
+}
+function toggleOverlay(name) {
+  overlays[name] = !overlays[name];
+  document.getElementById('tb-ov-'+name).className = overlays[name] ? 'tbtn on' : 'tbtn';
+  if (name === 'mask')   maskCanvas.style.display   = overlays.mask ? '' : 'none';
+  if (name === 'colmap') { colmapCanvas.style.display = overlays.colmap ? '' : 'none'; if (overlays.colmap && !colmapData) loadColmap(); }
+}
+function toggleEdit() {
+  editing = !editing;
+  document.getElementById('overlay-stack').className = editing ? 'editing' : '';
+  document.getElementById('tb-edit').className = editing ? 'tbtn on' : 'tbtn';
+  document.getElementById('edit-indicator').className = editing ? 'on' : '';
+  if (!editing) cancelActive();
+}
+
+// ── Canvas coords ────────────────────────────────────────────────────────────
+function cxy(e) {
+  const r = maskCanvas.getBoundingClientRect();
+  return [
+    (e.clientX - r.left) * (maskCanvas.width / r.width),
+    (e.clientY - r.top)  * (maskCanvas.height / r.height),
+  ];
+}
+function syncPos() {
+  const img = document.getElementById('source-img');
+  const r = img.getBoundingClientRect();
+  const w = document.getElementById('overlay-stack').getBoundingClientRect();
+  const s = 'position:absolute;left:'+(r.left-w.left)+'px;top:'+(r.top-w.top)+'px;width:'+r.width+'px;height:'+r.height+'px;';
+  maskCanvas.style.cssText   = s + 'opacity:0.55;display:'+(overlays.mask?'':'none')+';';
+  colmapCanvas.style.cssText = s + 'display:'+(overlays.colmap?'':'none')+';';
+  polyCanvas.style.cssText   = s + 'pointer-events:none;';
+}
+
+// ── Weight/filter color helpers ──────────────────────────────────────────────
+function wcolor(w, a) { return 'rgba('+Math.round((1-w)*80)+','+Math.round(w*200+55)+','+Math.round((1-w)*255)+','+a+')'; }
+const FCOLORS = {gaussian_blur:'#48f', median:'#f84', sharpen:'#4f8', brightness:'#ff4'};
+
+// ── Render: mask layer ───────────────────────────────────────────────────────
+function renderMask() {
+  const w = maskCanvas.width, h = maskCanvas.height;
+  maskCtx.clearRect(0, 0, w, h);
+  if (polygons.length) {
+    maskCtx.fillStyle = 'rgba(255,30,30,0.85)'; maskCtx.fillRect(0, 0, w, h);
+    maskCtx.globalCompositeOperation = 'destination-out'; maskCtx.fillStyle = 'rgba(0,0,0,1)';
+    for (const p of polygons) { if (p.length<3) continue; maskCtx.beginPath(); maskCtx.moveTo(p[0][0],p[0][1]); for (let i=1;i<p.length;i++) maskCtx.lineTo(p[i][0],p[i][1]); maskCtx.closePath(); maskCtx.fill(); }
+    maskCtx.globalCompositeOperation = 'source-over';
+  }
+  for (const wr of weights) { const p=wr.polygon; if(!p||p.length<3) continue; maskCtx.fillStyle=wcolor(wr.weight,0.4); maskCtx.beginPath(); maskCtx.moveTo(p[0][0],p[0][1]); for(let i=1;i<p.length;i++) maskCtx.lineTo(p[i][0],p[i][1]); maskCtx.closePath(); maskCtx.fill(); }
+  for (const f of filters) { const p=f.polygon; if(!p||p.length<3) continue; maskCtx.strokeStyle=FCOLORS[f.type]||'#888'; maskCtx.lineWidth=3; maskCtx.setLineDash([8,4]); maskCtx.beginPath(); maskCtx.moveTo(p[0][0],p[0][1]); for(let i=1;i<p.length;i++) maskCtx.lineTo(p[i][0],p[i][1]); maskCtx.closePath(); maskCtx.stroke(); maskCtx.setLineDash([]); }
+}
+
+// ── Render: COLMAP overlay (improved visibility) ─────────────────────────────
+function insideFg(px, py) {
+  if (!polygons.length) return true;
+  for (const poly of polygons) {
+    let inside = false;
+    for (let i = 0, j = poly.length-1; i < poly.length; j = i++) {
+      const xi=poly[i][0], yi=poly[i][1], xj=poly[j][0], yj=poly[j][1];
+      if ((yi > py) !== (yj > py) && px < (xj-xi)*(py-yi)/(yj-yi)+xi) inside = !inside;
+    }
+    if (inside) return true;
+  }
+  return false;
+}
+
+function renderColmap() {
+  const w = colmapCanvas.width, h = colmapCanvas.height;
+  colmapCtx.clearRect(0, 0, w, h);
+  if (!colmapData || !colmapData.keypoints) return;
+
+  let triCount = 0;
+
+  for (const [x, y, tri] of colmapData.keypoints) {
+    const fg = insideFg(x, y);
+    if (tri) {
+      triCount++;
+      // Dark outline ring for contrast on any background
+      colmapCtx.beginPath(); colmapCtx.arc(x, y, 7, 0, Math.PI*2);
+      colmapCtx.fillStyle = 'rgba(0,0,0,0.6)'; colmapCtx.fill();
+      // Bright inner fill
+      colmapCtx.beginPath(); colmapCtx.arc(x, y, 5, 0, Math.PI*2);
+      colmapCtx.fillStyle = fg ? '#00ff44' : '#ff3333';
+      colmapCtx.fill();
+      // Center dot
+      colmapCtx.beginPath(); colmapCtx.arc(x, y, 2, 0, Math.PI*2);
+      colmapCtx.fillStyle = 'rgba(255,255,255,0.7)'; colmapCtx.fill();
+    } else {
+      // Non-triangulated: medium dots with subtle outline
+      colmapCtx.beginPath(); colmapCtx.arc(x, y, 4.5, 0, Math.PI*2);
+      colmapCtx.fillStyle = 'rgba(0,0,0,0.4)'; colmapCtx.fill();
+      colmapCtx.beginPath(); colmapCtx.arc(x, y, 3, 0, Math.PI*2);
+      colmapCtx.fillStyle = fg ? 'rgba(80,180,255,0.7)' : 'rgba(140,140,140,0.5)';
+      colmapCtx.fill();
+    }
+  }
+
+  // Update COLMAP button with count
+  const btn = document.getElementById('tb-ov-colmap');
+  if (btn) {
+    const total = colmapData.keypoints.length;
+    btn.innerHTML = 'COLMAP <span class="tlabel">C</span> <span class="tlabel">' + triCount + '/' + total + '</span>';
+  }
+}
+
+// ── Render: polygon preview ──────────────────────────────────────────────────
+function renderPoly() {
+  const w = polyCanvas.width, h = polyCanvas.height;
+  polyCtx.clearRect(0, 0, w, h);
+  const drawPoly = (pts, color) => { if(pts.length<3) return; polyCtx.strokeStyle=color; polyCtx.lineWidth=2; polyCtx.setLineDash([]); polyCtx.beginPath(); polyCtx.moveTo(pts[0][0],pts[0][1]); for(let i=1;i<pts.length;i++) polyCtx.lineTo(pts[i][0],pts[i][1]); polyCtx.closePath(); polyCtx.stroke(); };
+  for (const p of polygons) drawPoly(p, '#4f4');
+  for (const wr of weights) if(wr.polygon) drawPoly(wr.polygon, wcolor(wr.weight,1));
+  for (const f of filters) if(f.polygon) drawPoly(f.polygon, FCOLORS[f.type]||'#888');
+  // Active polygon
+  if (activePts.length) {
+    polyCtx.strokeStyle = '#ff0'; polyCtx.lineWidth = 2; polyCtx.setLineDash([6,4]);
+    polyCtx.beginPath(); polyCtx.moveTo(activePts[0][0],activePts[0][1]);
+    for (let i=1;i<activePts.length;i++) polyCtx.lineTo(activePts[i][0],activePts[i][1]);
+    if (cursorPos) polyCtx.lineTo(cursorPos[0],cursorPos[1]);
+    polyCtx.stroke(); polyCtx.setLineDash([]);
+    polyCtx.fillStyle='#fff'; for(const p of activePts){polyCtx.beginPath();polyCtx.arc(p[0],p[1],4,0,Math.PI*2);polyCtx.fill();}
+    if (activePts.length>=3){polyCtx.strokeStyle='#4f4';polyCtx.lineWidth=1.5;polyCtx.beginPath();polyCtx.arc(activePts[0][0],activePts[0][1],SNAP,0,Math.PI*2);polyCtx.stroke();}
+  }
+  // Vertex dots
+  polyCtx.fillStyle='rgba(255,255,255,0.35)';
+  const allPts=[...polygons,...weights.map(w=>w.polygon),...filters.map(f=>f.polygon)].filter(Boolean);
+  for(const pts of allPts) for(const p of pts){polyCtx.beginPath();polyCtx.arc(p[0],p[1],3,0,Math.PI*2);polyCtx.fill();}
+}
+
+function renderAll() { renderMask(); renderPoly(); renderColmap(); renderRegionList(); }
+function cancelActive() { activePts=[]; cursorPos=null; renderPoly(); }
+
+// ── Region list ──────────────────────────────────────────────────────────────
+function renderRegionList() {
+  const el = document.getElementById('poly-list');
+  el.innerHTML = '';
+  if (!polygons.length && !weights.length && !filters.length) { el.innerHTML='<span class="help-text">No regions — draw polygons to define keep areas</span>'; return; }
+  polygons.forEach((_,i) => { el.innerHTML += '<div class="poly-item"><span style="color:#8f8">FG '+(i+1)+'</span><span class="del" onclick="delFg('+i+')">x</span></div>'; });
+  weights.forEach((wr,i) => { el.innerHTML += '<div class="poly-item"><span style="color:'+wcolor(wr.weight,1)+'">W'+(i+1)+' ='+wr.weight.toFixed(2)+'</span><span class="del" onclick="delWt('+i+')">x</span></div>'; });
+  filters.forEach((f,i) => { el.innerHTML += '<div class="poly-item"><span style="color:'+(FCOLORS[f.type]||'#888')+'">'+f.type+' r='+(f.radius||'-')+'</span><span class="del" onclick="delFlt('+i+')">x</span></div>'; });
+}
+function delFg(i)  { pushUndo(); polygons.splice(i,1); renderAll(); autoSave(); }
+function delWt(i)  { pushUndo(); weights.splice(i,1); renderAll(); autoSave(); }
+function delFlt(i) { pushUndo(); filters.splice(i,1); renderAll(); autoSave(); }
+
+// ── Event handlers ───────────────────────────────────────────────────────────
+maskCanvas.addEventListener('mousedown', e => { if (!editing) return; if (tool==='brush'){pushUndo();painting=true;brushAt(e);} });
+maskCanvas.addEventListener('mousemove', e => { if (!editing) return; if (tool==='brush'&&painting) brushAt(e); if (tool==='polygon'){cursorPos=cxy(e);renderPoly();} });
+window.addEventListener('mouseup', () => { if (painting) { painting=false; autoSave(); } else { painting=false; } });
+maskCanvas.addEventListener('click', e => { if (!editing||tool!=='polygon') return; polyClick(e); });
+maskCanvas.addEventListener('dblclick', e => { if (!editing||tool!=='polygon') return; e.preventDefault(); closePoly(); });
+
+function polyClick(e) {
+  const pt = cxy(e);
+  if (activePts.length>=3 && Math.hypot(pt[0]-activePts[0][0],pt[1]-activePts[0][1])<SNAP) { closePoly(); return; }
+  activePts.push(pt); renderPoly();
+}
+
+function closePoly() {
+  if (activePts.length<3) { cancelActive(); return; }
+  pushUndo();
+  if (layer==='fg')     polygons.push([...activePts]);
+  else if (layer==='weight') weights.push({polygon:[...activePts], weight: parseFloat(document.getElementById('weight-val').value)});
+  else if (layer==='filter') filters.push({polygon:[...activePts], type: document.getElementById('filter-type').value, radius: parseInt(document.getElementById('filter-radius').value)});
+  activePts=[]; cursorPos=null; renderAll();
+  autoSave();
+}
+
+function brushAt(e) {
+  const [x,y]=cxy(e); const r=parseInt(document.getElementById('brush-size').value);
+  maskCtx.globalCompositeOperation='source-over';
+  if (layer==='fg')    { maskCtx.fillStyle='rgba(255,30,30,0.85)'; }
+  else if(layer==='weight') { maskCtx.fillStyle=wcolor(parseFloat(document.getElementById('weight-val').value),0.4); }
+  maskCtx.beginPath(); maskCtx.arc(x,y,r,0,Math.PI*2); maskCtx.fill();
+}
+
+// ── COLMAP data ──────────────────────────────────────────────────────────────
+async function loadColmap() {
+  try {
+    const r = await fetch('/images/'+IMAGE_NAME+'/colmap');
+    if (!r.ok) return;
+    colmapData = await r.json();
+    renderColmap();
+  } catch {}
+}
+
+// ── Save / load / clear ──────────────────────────────────────────────────────
+let _lastSavedHash = '';
+
+async function saveMask() {
+  showFlash('saving...', 'saving');
+  try {
+    const resp = await fetch('/images/'+IMAGE_NAME+'/mask-data', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({polygons, weights, filters}),
+    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    _dirty = false;
+    _lastSavedHash = JSON.stringify({polygons, weights, filters});
+    const summary = polygons.length+'fg '+weights.length+'w '+filters.length+'f';
+    document.getElementById('mask-status').textContent = summary + ' (saved)';
+    document.getElementById('mask-status').style.color = '#8f8';
+    showFlash('saved ' + summary, 'saved');
+  } catch(e) {
+    showFlash('save failed: ' + e.message, 'error');
+  }
+}
+
+async function clearMask() {
+  pushUndo(); polygons=[]; weights=[]; filters=[]; activePts=[];
+  renderAll();
+  await fetch('/images/'+IMAGE_NAME+'/mask', {method:'DELETE'});
+  _dirty = false;
+  _lastSavedHash = JSON.stringify({polygons:[], weights:[], filters:[]});
+  document.getElementById('mask-status').textContent='cleared'; document.getElementById('mask-status').style.color='#888';
+}
+
+async function loadMaskData() {
+  try {
+    const r = await fetch('/images/'+IMAGE_NAME+'/mask-data'); if(!r.ok) return;
+    const d = await r.json();
+    if(d.polygons) polygons=d.polygons; if(d.weights) weights=d.weights; if(d.filters) filters=d.filters;
+    _lastSavedHash = JSON.stringify({polygons, weights, filters});
+    _dirty = false;
+    if(polygons.length||weights.length||filters.length) {
+      renderAll();
+      document.getElementById('mask-status').textContent=polygons.length+'fg '+weights.length+'w '+filters.length+'f';
+      document.getElementById('mask-status').style.color='#8f8';
+    }
+  } catch {}
+}
+
+// ── Real-time polling from frames.json ───────────────────────────────────────
+let _framesJsonHash = '';
+
+async function pollFramesJson() {
+  if (_dirty) return;  // don't overwrite unsaved edits
+  try {
+    const r = await fetch('/frames.json');
+    if (!r.ok) return;
+    const all = await r.json();
+    const hash = JSON.stringify(all);
+    if (hash === _framesJsonHash) return;
+    _framesJsonHash = hash;
+
+    // Update current image's mask data
+    const mine = all[IMAGE_NAME] || {};
+    const p = mine.polygons || [], w = mine.weights || [], f = mine.filters || [];
+    const maskHash = JSON.stringify({polygons: p, weights: w, filters: f});
+    if (maskHash !== _lastSavedHash) {
+      _lastSavedHash = maskHash;
+      polygons = p; weights = w; filters = f;
+      renderAll();
+      document.getElementById('mask-status').textContent = polygons.length+'fg '+weights.length+'w '+filters.length+'f';
+      document.getElementById('mask-status').style.color = '#8f8';
+    }
+
+    // Update exclusion state
+    if (mine.excluded !== undefined && mine.excluded !== isExcluded) {
+      isExcluded = mine.excluded;
+      updatePipelineControls(_trainState);
+    }
+
+    // Update frame list sidebar (toggle states may have changed)
+    const listData = Object.entries(all).map(([name, entry]) => ({
+      name,
+      excluded: !!entry.excluded,
+      masked: !!(entry.polygons || entry.weights || entry.filters),
+    }));
+    if (typeof _frameListData !== 'undefined') {
+      _frameListData = listData;
+      _frameListHash = '';  // force re-render
+      renderFrameList();
+    }
+  } catch {}
+}
+
+// ── Exclude / focus ──────────────────────────────────────────────────────────
+async function toggleExclude() {
+  await fetch('/images/'+IMAGE_NAME+'/exclude',{method:isExcluded?'DELETE':'POST'});
+  isExcluded=!isExcluded;
+  updatePipelineControls(_trainState);
+}
+function focusCamera() { postCommand('focus_camera',{camera_name:IMAGE_NAME}); }
+function focusClear()  { postCommand('focus_camera',{camera_name:null}); }
+
+// ── Training poll ────────────────────────────────────────────────────────────
+let _chartMode = 'all';
+let _chartTick = 0;
+let _maskPollTick = 0;
+
+function toggleChartMode() {
+  _chartMode = _chartMode === 'all' ? 'camera' : 'all';
+  document.getElementById('chart-mode-btn').textContent =
+    _chartMode === 'all' ? 'all cameras' : 'this camera';
+  _chartTick = 3;
+}
+
+async function tick() {
+  try {
+    const d = await pollState();
+    const ps = document.getElementById('poll-status');
+
+    // Update shared components (safe — may not exist)
+    try {
+      if (typeof updateTrainingHeader === 'function') updateTrainingHeader(d);
+      if (typeof updatePipelineControls === 'function') updatePipelineControls(d);
+      // Training preview is in run bar header
+    } catch(e) {}
+
+    if (!d) {
+      ps.textContent='idle'; ps.className='poll-status';
+    } else {
+      ps.textContent='live'; ps.className='poll-status ok';
+    }
+
+    // Chart (every ~2s)
+    if (++_chartTick % 4 === 0) {
+      const cam = _chartMode === 'camera' ? IMAGE_NAME : '';
+      const history = await fetchHistory(cam);
+      if (history.length) drawLossChart('loss-chart', history, {highlight: IMAGE_NAME});
+    }
+
+    // Poll frames.json for real-time updates (every ~2s)
+    if (++_maskPollTick % 4 === 0) {
+      pollFramesJson();
+    }
+
+    // Poll pipeline status
+    await pollPipeline();
+    try { if (typeof updatePipelineControls === 'function') updatePipelineControls(d); } catch(e) {}
+  } catch(e) { console.warn('tick error:', e); }
+}
+
+// ── Init ─────────────────────────────────────────────────────────────────────
+async function init() {
+  // Init shared components — wrapped in try/catch so editor works even if
+  // components.js failed to load (e.g. server not restarted)
+  try {
+    if (typeof initTrainingHeader === 'function') initTrainingHeader('train-header');
+    if (typeof initPipelineControls === 'function') initPipelineControls('pipeline-controls', {stages: false, image: IMAGE_NAME});
+    // Training preview moved to run bar header
+    if (typeof initFrameList === 'function') initFrameList('frame-list', IMAGE_NAME);
+  } catch (e) { console.warn('components init failed:', e); }
+
+  // Edit indicator — starts on
+  document.getElementById('edit-indicator').className = 'on';
+
+  // Load image + set up canvases
+  const img = document.getElementById('source-img');
+  img.src = '/images/'+IMAGE_NAME+'/full';
+  img.onload = () => {
+    maskCanvas.width=colmapCanvas.width=polyCanvas.width=img.naturalWidth;
+    maskCanvas.height=colmapCanvas.height=polyCanvas.height=img.naturalHeight;
+    colmapCanvas.style.display='none';
+    syncPos(); loadMaskData();
+  };
+
+  // Load frame list for nav + exclusion state
+  try {
+    const r = await fetch('/images/list');
+    if (r.ok) {
+      allFrames = await r.json();
+      currentIdx = allFrames.findIndex(f => f.name === IMAGE_NAME);
+      updateNav();
+      const fr = allFrames[currentIdx];
+      if (fr) {
+        isExcluded = fr.excluded;
+        try { updatePipelineControls(_trainState); } catch(e) {}
+      }
+      const fc = document.getElementById('frame-count');
+      if (fc) fc.textContent = allFrames.length;
+    }
+  } catch(e) { console.warn('frame list fetch failed:', e); }
+}
+
+function updateNav() {
+  const p=document.getElementById('btn-prev'),n=document.getElementById('btn-next');
+  if(currentIdx>0) p.href='/images/'+allFrames[currentIdx-1].name+'/edit'; else p.style.display='none';
+  if(currentIdx>=0&&currentIdx<allFrames.length-1) n.href='/images/'+allFrames[currentIdx+1].name+'/edit'; else n.style.display='none';
+}
+new ResizeObserver(syncPos).observe(document.getElementById('source-img'));
+
+// ── Keyboard ─────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
+  if(e.key==='Escape') cancelActive();
+  if(e.key==='ArrowLeft'&&currentIdx>0) location.href='/images/'+allFrames[currentIdx-1].name+'/edit';
+  if(e.key==='ArrowRight'&&currentIdx<allFrames.length-1) location.href='/images/'+allFrames[currentIdx+1].name+'/edit';
+  if(e.key==='e'||e.key==='E') toggleEdit();
+  if(e.key==='x'||e.key==='X') toggleExclude();
+  if(e.key==='b'||e.key==='B') setTool('brush');
+  if(e.key==='p'||e.key==='P') setTool('polygon');
+  if(e.key==='f'||e.key==='F') focusCamera();
+  if(e.key==='m'||e.key==='M') toggleOverlay('mask');
+  if(e.key==='c'||e.key==='C') toggleOverlay('colmap');
+  if(e.key==='z'&&(e.ctrlKey||e.metaKey)){e.preventDefault();undoLast();}
+  if(e.key==='z'&&!e.ctrlKey&&!e.metaKey) undoLast();
+  if(e.key==='s'&&(e.ctrlKey||e.metaKey)){e.preventDefault();saveMask();}
+  if(e.key==='1') setLayer('fg'); if(e.key==='2') setLayer('weight'); if(e.key==='3') setLayer('filter');
+});
+
+init(); tick(); setInterval(tick, 500);
+</script>
+</body>
+</html>

@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ttgs — training</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/base.css">
+  <style>
+    #main { display: flex; flex: 1; overflow: hidden; }
+
+    /* ── center panel ── */
+    #center { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* ── render/gt/diff row ── */
+    #preview-row {
+      display: grid; grid-template-columns: 1fr 1fr 1fr;
+      gap: 1px; background: #2a2a2a; flex: 1; min-height: 0;
+    }
+    .preview-cell {
+      background: #111; display: flex; flex-direction: column;
+      overflow: hidden; position: relative;
+    }
+    .preview-cell img {
+      flex: 1; object-fit: contain; width: 100%; min-height: 0;
+      display: none; background: #0a0a0a;
+    }
+    .preview-cell .no-data {
+      flex: 1; display: flex; align-items: center; justify-content: center;
+      color: #333; font-size: 14px;
+    }
+    .preview-label {
+      padding: 6px 12px; background: #1a1a1a;
+      border-bottom: 1px solid #222; font-size: 13px; color: #999;
+      display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+    }
+    .preview-label b { color: #ccc; }
+
+    /* ── mask overlay on diff ── */
+    #diff-wrap { position: relative; flex: 1; display: flex; min-height: 0; }
+    #diff-wrap img { flex: 1; object-fit: contain; width: 100%; min-height: 0; }
+    #mask-overlay {
+      position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      pointer-events: none;
+    }
+    #mask-overlay img {
+      max-width: 100%; max-height: 100%; object-fit: contain;
+      opacity: 0.3; mix-blend-mode: multiply;
+    }
+
+    /* ── chart strip ── */
+    #chart-area {
+      height: 180px; flex-shrink: 0; background: #0e0e0e;
+      border-top: 1px solid #2a2a2a; position: relative;
+    }
+    #chart-area .chart-header {
+      position: absolute; top: 4px; left: 10px; z-index: 1;
+      font-size: 10px; color: #555;
+    }
+
+    /* ── GPU metrics panel ── */
+    #gpu-panel {
+      display: none; gap: 2px; background: #2a2a2a;
+      border-top: 1px solid #2a2a2a; flex-shrink: 0; height: 80px;
+    }
+    #gpu-panel.visible { display: flex; }
+    .gpu-card {
+      flex: 1; background: #111; display: flex; flex-direction: column;
+      padding: 4px 8px; min-width: 0; overflow: hidden;
+    }
+    .gpu-val {
+      font-size: 15px; font-weight: bold; font-family: monospace;
+      white-space: nowrap; overflow: hidden; line-height: 1.3;
+    }
+    .gpu-spark { flex: 1; min-height: 0; }
+    .gpu-lbl {
+      font-size: 9px; color: #555; text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+
+    /* ── stats bar ── */
+    #stats-bar {
+      display: flex; align-items: center; gap: 18px;
+      padding: 8px 16px; background: #161616;
+      border-top: 1px solid #222; font-size: 14px; color: #999;
+      flex-shrink: 0;
+    }
+    #stats-bar b { color: #fff; }
+    .cam-name { color: #4af; font-weight: bold; }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <a href="/"><b>ttgs</b></a> <span class="sep">|</span>
+  <a href="/images">images</a> <span class="sep">|</span>
+  <b>training</b>
+  <span class="spacer"></span>
+  <span class="poll-status" id="poll-status">waiting...</span>
+</div>
+
+<!-- ── Run Bar (shared: status + live config) ── -->
+<div class="run-bar" id="run-bar"></div>
+
+<div id="main">
+  <!-- ── Left pane: controls + frames ── -->
+  <div class="sidebar">
+    <div id="pipeline-controls"></div>
+    <div class="ctrl-section">
+      <h3>Frames <span class="ctrl-tag" id="frame-count">--</span></h3>
+      <div class="fl-scroll" id="frame-list"></div>
+    </div>
+  </div>
+
+  <!-- ── Center: preview + chart ── -->
+  <div id="center">
+    <!-- render / GT / diff -->
+    <div id="preview-row">
+      <div class="preview-cell">
+        <div class="preview-label"><b>Render</b></div>
+        <div class="no-data" id="render-ph">waiting for training...</div>
+        <img id="render-img" />
+      </div>
+      <div class="preview-cell">
+        <div class="preview-label"><b>Ground Truth</b></div>
+        <div class="no-data" id="gt-ph">--</div>
+        <img id="gt-img" />
+      </div>
+      <div class="preview-cell">
+        <div class="preview-label">
+          <b>Diff</b> <span class="muted small">error heatmap</span>
+          <span class="spacer"></span>
+          <label style="cursor:pointer;color:#888;font-size:10px">
+            <input type="checkbox" id="show-mask" onchange="toggleMaskOverlay()"> mask overlay
+          </label>
+        </div>
+        <div id="diff-wrap">
+          <div class="no-data" id="diff-ph">--</div>
+          <img id="diff-img" />
+          <div id="mask-overlay" style="display:none">
+            <img id="mask-img" />
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- stats bar -->
+    <div id="stats-bar">
+      <span>cam: <span class="cam-name" id="st-cam">--</span></span>
+      <span>L1 <b id="st-l1">--</b></span>
+      <span>SSIM <b id="st-ssim">--</b></span>
+      <span>MSE <b id="st-mse">--</b></span>
+      <span><b id="st-n">--</b> gaussians</span>
+      <span class="spacer"></span>
+      <span id="st-mask-status" style="color:#555">--</span>
+    </div>
+
+    <!-- loss chart -->
+    <div id="chart-area">
+      <div class="chart-header"><b>Loss</b> L1 / SSIM / MSE</div>
+      <canvas id="loss-chart" width="900" height="180" style="width:100%;height:100%"></canvas>
+    </div>
+
+    <!-- GPU metrics -->
+    <div id="gpu-panel">
+      <div class="gpu-card">
+        <div class="gpu-val" id="gv-util" style="color:#4af">--</div>
+        <canvas class="gpu-spark" id="gs-util" width="120" height="28"></canvas>
+        <div class="gpu-lbl">gpu util</div>
+      </div>
+      <div class="gpu-card">
+        <div class="gpu-val" id="gv-temp" style="color:#f84">--</div>
+        <canvas class="gpu-spark" id="gs-temp" width="120" height="28"></canvas>
+        <div class="gpu-lbl">temperature</div>
+      </div>
+      <div class="gpu-card">
+        <div class="gpu-val" id="gv-power" style="color:#f44">--</div>
+        <canvas class="gpu-spark" id="gs-power" width="120" height="28"></canvas>
+        <div class="gpu-lbl">power</div>
+      </div>
+      <div class="gpu-card">
+        <div class="gpu-val" id="gv-vram" style="color:#a6f">--</div>
+        <canvas class="gpu-spark" id="gs-vram" width="120" height="28"></canvas>
+        <div class="gpu-lbl">vram</div>
+      </div>
+      <div class="gpu-card">
+        <div class="gpu-val" id="gv-freq" style="color:#fd0">--</div>
+        <canvas class="gpu-spark" id="gs-freq" width="120" height="28"></canvas>
+        <div class="gpu-lbl">gpu freq</div>
+      </div>
+      <div class="gpu-card">
+        <div class="gpu-val" id="gv-vfreq" style="color:#48f">--</div>
+        <canvas class="gpu-spark" id="gs-vfreq" width="120" height="28"></canvas>
+        <div class="gpu-lbl">vram freq</div>
+      </div>
+      <div class="gpu-card">
+        <div class="gpu-val" id="gv-fan" style="color:#4f8">--</div>
+        <canvas class="gpu-spark" id="gs-fan" width="120" height="28"></canvas>
+        <div class="gpu-lbl">fan</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/base.js"></script>
+<script src="/static/components.js"></script>
+<script>
+const ps = document.getElementById('poll-status');
+let _chartTick = 0;
+let _currentCam = null;
+
+// Init shared components
+try {
+  if (typeof initRunBar === 'function') initRunBar('run-bar');
+  if (typeof initPipelineControls === 'function') initPipelineControls('pipeline-controls', {stages: true});
+  if (typeof initFrameList === 'function') initFrameList('frame-list');
+} catch(e) { console.warn('components init:', e); }
+
+// ── Mask overlay toggle ─────────────────────────────────────────────────────
+let _showMask = false;
+
+function toggleMaskOverlay() {
+  _showMask = document.getElementById('show-mask').checked;
+  document.getElementById('mask-overlay').style.display = _showMask ? '' : 'none';
+  if (_showMask && _currentCam) loadMaskOverlay(_currentCam);
+}
+
+async function loadMaskOverlay(camName) {
+  const img = document.getElementById('mask-img');
+  if (!img) return;
+  // Try to load the rasterized mask PNG for this camera
+  try {
+    const r = await fetch('/images/' + camName + '/mask.png');
+    if (r.ok) {
+      const blob = await r.blob();
+      img.src = URL.createObjectURL(blob);
+      img.style.display = 'block';
+      document.getElementById('st-mask-status').textContent = 'mask active';
+      document.getElementById('st-mask-status').style.color = '#8f8';
+    } else {
+      img.style.display = 'none';
+      document.getElementById('st-mask-status').textContent = 'no mask';
+      document.getElementById('st-mask-status').style.color = '#555';
+    }
+  } catch(e) {
+    img.style.display = 'none';
+  }
+}
+
+// ── Poll loop ───────────────────────────────────────────────────────────────
+async function tick() {
+  try {
+    const d = await pollState();
+
+    // Update shared components
+    try {
+      if (typeof updateRunBar === 'function') updateRunBar(d);
+      if (typeof updatePipelineControls === 'function') updatePipelineControls(d);
+    } catch(e) {}
+
+    if (d) {
+      ps.textContent = 'live'; ps.className = 'poll-status ok';
+      setImg('render-img', 'render-ph', d.render_b64);
+      setImg('gt-img', 'gt-ph', d.gt_b64);
+      setImg('diff-img', 'diff-ph', d.diff_b64);
+
+      // Stats
+      document.getElementById('st-cam').textContent = d.camera_name || '--';
+      document.getElementById('st-l1').textContent = d.l1.toFixed(4);
+      document.getElementById('st-ssim').textContent = d.ssim.toFixed(4);
+      document.getElementById('st-mse').textContent = d.mse.toFixed(5);
+      document.getElementById('st-n').textContent = d.n_gaussians.toLocaleString();
+
+      // Load mask overlay when camera changes
+      if (d.camera_name !== _currentCam) {
+        _currentCam = d.camera_name;
+        if (_showMask) loadMaskOverlay(_currentCam);
+      }
+
+      // Chart
+      if (++_chartTick % 4 === 0) {
+        const history = await fetchHistory();
+        if (history.length) drawLossChart('loss-chart', history);
+      }
+    } else {
+      ps.textContent = 'idle'; ps.className = 'poll-status';
+    }
+
+    await pollPipeline(); updatePills();
+    try { if (typeof updatePipelineControls === 'function') updatePipelineControls(d); } catch(e) {}
+
+    // Poll frame list every ~4s
+    if (_chartTick % 8 === 0 && typeof pollFrameList === 'function') {
+      pollFrameList();
+    }
+  } catch(e) { console.warn('tick:', e); }
+}
+
+tick();
+setInterval(tick, 500);
+
+// ── GPU metrics ────────────────────────────────────────────────────────────
+const _gpuHist = {};
+const _GPU_MAX = 60;
+
+function _gpuSparkline(canvas, values, color, fixedMin, fixedMax) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  if (values.length < 2) return;
+  let lo = fixedMin !== undefined ? fixedMin : Math.min(...values);
+  let hi = fixedMax !== undefined ? fixedMax : Math.max(...values);
+  if (lo === hi) hi = lo + 1;
+  const toY = v => H - ((v - lo) / (hi - lo)) * (H - 2) - 1;
+  // fill
+  ctx.fillStyle = color + '18';
+  ctx.beginPath(); ctx.moveTo(0, H);
+  for (let i = 0; i < values.length; i++)
+    ctx.lineTo((i / (values.length - 1)) * W, toY(values[i]));
+  ctx.lineTo(W, H); ctx.fill();
+  // line
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.beginPath();
+  for (let i = 0; i < values.length; i++) {
+    const x = (i / (values.length - 1)) * W, y = toY(values[i]);
+    i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+}
+
+function _gpuCard(key, val, unit, color, opts) {
+  const el = document.getElementById('gv-' + key);
+  const cv = document.getElementById('gs-' + key);
+  if (!el) return;
+  if (val === undefined || val === null) { el.textContent = '--'; return; }
+  const disp = opts && opts.max ? val + ' / ' + opts.max : String(val);
+  el.textContent = disp + ' ' + unit;
+  if (!_gpuHist[key]) _gpuHist[key] = [];
+  _gpuHist[key].push(val);
+  if (_gpuHist[key].length > _GPU_MAX) _gpuHist[key].shift();
+  if (cv) _gpuSparkline(cv, _gpuHist[key], color,
+    opts && opts.fixedMin, opts && opts.fixedMax);
+}
+
+async function pollGpu() {
+  try {
+    const r = await fetch('/gpu');
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d.available) return;
+    document.getElementById('gpu-panel').classList.add('visible');
+    _gpuCard('util',  d.gpu_util_pct,  '%',   '#4af', {fixedMin:0, fixedMax:100});
+    _gpuCard('temp',  d.gpu_temp_c,    '\u00b0C', '#f84');
+    _gpuCard('power', d.gpu_power_w,   'W',   '#f44');
+    _gpuCard('vram',  d.vram_used_gb,  'GB',  '#a6f', {max: d.vram_total_gb, fixedMin:0, fixedMax: d.vram_total_gb});
+    _gpuCard('freq',  d.gpu_freq_mhz,  'MHz', '#fd0');
+    _gpuCard('vfreq', d.vram_freq_mhz, 'MHz', '#48f');
+    _gpuCard('fan',   d.fan_rpm,       'RPM', '#4f8');
+  } catch(e) {}
+}
+pollGpu();
+setInterval(pollGpu, 2000);
+</script>
+</body>
+</html>

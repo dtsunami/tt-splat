@@ -1,0 +1,74 @@
+# ttgs default configuration
+# Override any value via --config my.toml or environment variables TTGS_*
+
+[extract]
+# Target frames-per-second to sample from video.
+# Lower = fewer frames, faster SfM; higher = more coverage.
+fps = 2.0
+# Hard cap on total extracted frames (0 = unlimited).
+max_frames = 300
+# Downsample images to this width before SfM/training (-1 = native).
+# The B70's 32 GB VRAM comfortably handles full-res; reduce for faster SfM.
+max_width = -1
+# Image format written to disk.
+format = "jpg"
+# JPEG quality when format = "jpg".
+quality = 95
+
+[sfm]
+# Feature matcher strategy.
+# "exhaustive"  – best quality, O(n²) pairs, good for ≤400 frames
+# "sequential"  – good for video walkthroughs, O(n) pairs
+# "vocab_tree"  – best for large unordered collections
+matcher = "exhaustive"
+# Assume all images share a single camera model (recommended for video).
+single_camera = true
+# COLMAP camera model. "OPENCV" supports radial+tangential distortion.
+camera_model = "OPENCV"
+# If true, run image_undistorter after mapping (required by OpenSplat).
+undistort = true
+
+[train]
+# Total optimisation iterations.
+iterations = 30_000
+# Spherical harmonic degree for view-dependent colour (0–3).
+# Higher = better reflections, more VRAM; 3 is standard.
+sh_degree = 3
+# Training image resolution divisor (-1 = native, 1 = full, 2 = half, etc.).
+resolution = -1
+# SSIM loss weight (λ in the 3DGS paper).
+lambda_dssim = 0.2
+# Log loss every N iterations.
+log_every = 500
+# Save a checkpoint every N iterations (0 = only at end).
+save_every = 5_000
+# Densification interval.
+densify_every = 100
+# Start densifying after this many iterations.
+densify_from = 500
+# Stop densifying after this many iterations.
+densify_until = 15_000
+# Gradient threshold for densification.
+densify_grad_threshold = 0.0002
+# Opacity reset interval.
+opacity_reset_every = 3_000
+# Save per-camera render snapshots every N steps (0 = disabled).
+# Creates snapshots/{camera}/step_{N}.png — stitch into video with ffmpeg.
+snapshot_every = 500
+
+[export]
+# Output format: "splat" (antimatter15 binary) or "ply" (raw Gaussians).
+format = "splat"
+# Sort Gaussians by opacity before writing (improves alpha-blending in viewers).
+sort_by_opacity = true
+# Maximum number of Gaussians to export (0 = all).
+# The B70's 32 GB easily holds millions; set a limit if targeting web viewers.
+max_gaussians = 0
+
+[viewer]
+# Local port for the built-in HTTP viewer.
+port = 8765
+# Automatically open the browser when launching the viewer.
+auto_open = true
+# Background colour as a hex string.
+background = "#1a1a1a"

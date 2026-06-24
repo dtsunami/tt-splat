@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ttgs"
+version = "0.1.0"
+description = "Gaussian Splatting pipeline for Tenstorrent Blackhole (tt-splat) — forked from arcgs"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["gaussian-splatting", "3dgs", "tenstorrent", "blackhole", "3d-reconstruction"]
+authors = [{ name = "tt-splat contributors" }]
+
+dependencies = [
+    "typer>=0.12",
+    "rich>=13",
+    "requests>=2.32",
+    "numpy>=1.26",
+    "Pillow>=10",
+    "tqdm>=4.66",
+    "torch>=2.6",
+    "python-dotenv>=1.0",
+    "tomli>=2.0; python_version < '3.11'",
+    # gsplat: pure-Python 3DGS training reference path (CPU/CUDA).
+    "gsplat>=1.0",
+    "packaging",
+    # viser: WebGL viewer served from Python — used by `ttgs view` and --live training.
+    "viser>=0.2",
+    # Dashboard: interactive training monitor (render vs GT vs diff, mask painter, pruning).
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+ttgs = "ttgs.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/tenstorrent/tt-splat"
+Issues = "https://github.com/tenstorrent/tt-splat/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ttgs"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true

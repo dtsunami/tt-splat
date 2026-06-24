@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ttgs — images</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/base.css">
+  <style>
+    body { overflow: auto; }
+    #toolbar {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 16px; background: #161616;
+      border-bottom: 1px solid #222; position: sticky; top: 0; z-index: 10;
+    }
+    #toolbar button { width: auto; }
+    #grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 2px; padding: 2px;
+    }
+    .card {
+      position: relative; background: #1a1a1a; border: 1px solid #2a2a2a;
+      cursor: pointer; transition: border-color .15s;
+    }
+    .card:hover { border-color: #4af; }
+    .card.excluded { opacity: .35; }
+    .card.excluded .card-overlay { display: flex; }
+    .card img { display: block; width: 100%; aspect-ratio: 4/3; object-fit: cover; }
+    .card-bar {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 5px 10px; font-size: 13px; color: #999;
+    }
+    .card-bar .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+    .card-overlay {
+      position: absolute; inset: 0; display: none;
+      align-items: center; justify-content: center;
+      background: rgba(0,0,0,.6); font-size: 14px; color: #f88; pointer-events: none;
+    }
+    .card-actions {
+      position: absolute; top: 6px; right: 6px; display: none; gap: 4px;
+    }
+    .card:hover .card-actions { display: flex; }
+    .card-actions button {
+      width: auto; background: rgba(0,0,0,.7); padding: 2px 8px; font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <a href="/"><b>ttgs</b></a> <span class="sep">|</span>
+  <a href="/training">training</a> <span class="sep">|</span>
+  <b>Images</b> <span class="sep">|</span>
+  <span class="small muted" id="summary">loading...</span>
+  <span class="spacer"></span>
+  <span class="poll-status" id="poll-status">--</span>
+</div>
+
+<!-- ── Run Bar (shared: status + live config) ── -->
+<div class="run-bar" id="run-bar"></div>
+
+<div id="toolbar">
+  <button class="primary" onclick="runSfm()" style="width:auto">Re-run SfM with masks</button>
+  <button onclick="runTrain()" style="width:auto">Re-run Training</button>
+  <button class="danger" onclick="excludeAll(true)" style="width:auto">Exclude all</button>
+  <button onclick="excludeAll(false)" style="width:auto">Include all</button>
+</div>
+
+<div id="grid"></div>
+
+<script src="/static/base.js"></script>
+<script src="/static/components.js"></script>
+<script>
+initRunBar('run-bar');
+
+// Poll training state for run bar
+async function _galleryTick() {
+  try {
+    const d = await pollState();
+    updateRunBar(d);
+    const ps = document.getElementById('poll-status');
+    if (ps) { ps.textContent = d ? 'live' : 'idle'; ps.className = d ? 'poll-status ok' : 'poll-status'; }
+  } catch(e) {}
+}
+_galleryTick();
+setInterval(_galleryTick, 1000);
+
+let frames = [];
+
+async function load() {
+  const r = await fetch('/images/list');
+  if (!r.ok) return;
+  frames = await r.json();
+  render();
+}
+
+function render() {
+  const excl = frames.filter(f=>f.excluded).length, mask = frames.filter(f=>f.masked).length;
+  document.getElementById('summary').textContent =
+    `${frames.length} frames | ${excl} excluded | ${mask} masked`;
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  for (const f of frames) {
+    const card = document.createElement('div');
+    card.className = 'card' + (f.excluded ? ' excluded' : '');
+    card.innerHTML = `
+      <img src="/images/${f.name}/thumb" loading="lazy" />
+      <div class="card-bar">
+        <span class="name">${f.name}</span>
+        ${f.masked ? '<span class="badge mask">mask</span>' : ''}
+      </div>
+      <div class="card-overlay">EXCLUDED</div>
+      <div class="card-actions">
+        <button class="${f.excluded ? 'active' : ''}"
+                onclick="event.stopPropagation(); toggle('${f.name}', ${!f.excluded})">
+          ${f.excluded ? 'Include' : 'Exclude'}
+        </button>
+      </div>`;
+    card.addEventListener('click', () => location.href = `/images/${f.name}/edit`);
+    grid.appendChild(card);
+  }
+}
+
+async function toggle(name, excluded) {
+  await fetch(`/images/${name}/exclude`, {method: excluded ? 'POST' : 'DELETE'});
+  const f = frames.find(x=>x.name===name); if (f) f.excluded = excluded;
+  render();
+}
+async function excludeAll(ex) {
+  for (const f of frames) {
+    if (f.excluded !== ex) {
+      await fetch(`/images/${f.name}/exclude`, {method: ex ? 'POST' : 'DELETE'});
+      f.excluded = ex;
+    }
+  }
+  render();
+}
+async function runSfm()   { await runFrom('sfm'); }
+async function runTrain()  { await runFrom('train'); }
+
+load();
+</script>
+</body>
+</html>

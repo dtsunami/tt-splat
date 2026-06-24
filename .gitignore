@@ -1,0 +1,8 @@
+build/
+generated/
+work/*
+!work/scene/          # keep the sample dataset the quickstart needs
+**/__pycache__/
+*.pyc
+*.egg-info/           # pip install -e . creates ttgs.egg-info
+.venv/

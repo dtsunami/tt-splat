@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ttgs</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/base.css">
+  <style>
+    /* ── layout ── */
+    #main { display: flex; flex: 1; overflow: hidden; }
+    #content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* ── mosaic ── */
+    #mosaic-wrap { flex: 1; overflow-y: auto; background: #0e0e0e; }
+    #mosaic {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: 2px; padding: 2px;
+    }
+    .thumb {
+      position: relative; cursor: pointer; background: #1a1a1a;
+      border: 1px solid transparent; transition: border-color .15s;
+    }
+    .thumb:hover { border-color: #4af; }
+    .thumb.excluded { opacity: .3; }
+    .thumb.excluded::after {
+      content: 'EXCL'; position: absolute; inset: 0;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0,0,0,.5); color: #f88; font-size: 11px; pointer-events: none;
+    }
+    .thumb img { display: block; width: 100%; aspect-ratio: 4/3; object-fit: cover; }
+    .thumb-bar {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 3px 8px; font-size: 12px; color: #888;
+    }
+    .thumb-bar .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+    .thumb-x {
+      position: absolute; top: 4px; right: 4px; display: none;
+      background: rgba(0,0,0,.75); color: #f88; border: 1px solid #633;
+      padding: 2px 8px; font-size: 12px; cursor: pointer; border-radius: 3px; font-family: monospace;
+    }
+    .thumb:hover .thumb-x { display: block; }
+    .thumb-x:hover { background: #522; }
+    #mosaic-empty { padding: 40px; color: #444; text-align: center; font-size: 14px; }
+
+    /* ── training panels ── */
+    #train-panels {
+      display: none; flex-shrink: 0; height: 200px;
+      border-top: 1px solid #2a2a2a;
+      grid-template-columns: 1fr 1fr 1fr 2fr; gap: 1px; background: #2a2a2a;
+    }
+    #train-panels.visible { display: grid; }
+    #loss-chart { background: #0e0e0e; }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <span><b>ttgs</b></span>
+  <span class="sep">|</span>
+  <a href="/training">training</a>
+  <span class="sep">|</span>
+  <div class="stage-pills">
+    <span class="pill idle" data-stage="extract"  onclick="runFrom('extract')">Extract</span>
+    <span class="pill idle" data-stage="sfm"      onclick="runFrom('sfm')">SfM</span>
+    <span class="pill idle" data-stage="train"    onclick="runFrom('train')">Train</span>
+    <span class="pill idle" data-stage="export"   onclick="runFrom('export')">Export</span>
+  </div>
+  <span class="sep">|</span>
+  <span id="img-summary" class="small muted">--</span>
+  <span class="spacer"></span>
+  <span class="poll-status" id="poll-status">waiting...</span>
+</div>
+
+<!-- ── Run Bar (shared: status + live config) ── -->
+<div class="run-bar" id="run-bar"></div>
+
+<div id="main">
+  <div class="sidebar">
+    <!-- Pipeline controls (shared component) -->
+    <div id="pipeline-controls"></div>
+  </div>
+
+  <div id="content">
+    <div id="mosaic-wrap">
+      <div id="mosaic"></div>
+      <div id="mosaic-empty">loading frames...</div>
+    </div>
+
+    <div id="train-panels">
+      <div class="panel">
+        <div class="panel-label"><b>Render</b></div>
+        <div class="no-data" id="render-ph">--</div>
+        <img id="render-img" />
+      </div>
+      <div class="panel">
+        <div class="panel-label"><b>Ground Truth</b></div>
+        <div class="no-data" id="gt-ph">--</div>
+        <img id="gt-img" />
+      </div>
+      <div class="panel">
+        <div class="panel-label"><b>Diff</b> <span class="muted small">error heatmap</span></div>
+        <div class="no-data" id="diff-ph">--</div>
+        <img id="diff-img" />
+      </div>
+      <div class="panel" style="padding:0">
+        <div class="panel-label"><b>Loss</b> <span class="muted small">L1 / SSIM / MSE</span></div>
+        <canvas id="loss-chart" width="500" height="160" style="width:100%;height:100%"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/base.js"></script>
+<script src="/static/components.js"></script>
+<script>
+let frames = [];
+const ps = document.getElementById('poll-status');
+
+// Init shared components
+initRunBar('run-bar');
+initPipelineControls('pipeline-controls', {stages: true});
+
+// ── Mosaic ───────────────────────────────────────────────────────────────────
+async function loadMosaic() {
+  try {
+    const r = await fetch('/images/list');
+    if (!r.ok) return;
+    frames = await r.json();
+  } catch { return; }
+
+  const grid = document.getElementById('mosaic');
+  const empty = document.getElementById('mosaic-empty');
+  if (!frames.length) { empty.textContent = 'No frames — run Extract first'; return; }
+  empty.style.display = 'none';
+
+  grid.innerHTML = '';
+  for (const f of frames) {
+    const el = document.createElement('div');
+    el.className = 'thumb' + (f.excluded ? ' excluded' : '');
+    el.innerHTML =
+      '<img src="/images/' + f.name + '/thumb" loading="lazy" />' +
+      '<div class="thumb-bar">' +
+      '  <span class="name">' + f.name + '</span>' +
+      (f.masked ? '<span class="badge mask">M</span>' : '') +
+      '</div>' +
+      '<div class="thumb-x" onclick="event.stopPropagation(); toggleExcl(\'' + f.name + '\')">' + (f.excluded ? '+' : 'x') + '</div>';
+    el.addEventListener('click', () => location.href = '/images/' + f.name + '/edit');
+    grid.appendChild(el);
+  }
+  updateSummary();
+}
+
+function updateSummary() {
+  const t = frames.length, e = frames.filter(f=>f.excluded).length, m = frames.filter(f=>f.masked).length;
+  document.getElementById('img-summary').textContent = t + ' images | ' + e + ' excl | ' + m + ' masked';
+}
+
+async function toggleExcl(name) {
+  const f = frames.find(x => x.name === name);
+  if (!f) return;
+  await fetch('/images/' + name + '/exclude', {method: f.excluded ? 'DELETE' : 'POST'});
+  f.excluded = !f.excluded;
+  loadMosaic();
+}
+
+// ── Poll loop ────────────────────────────────────────────────────────────────
+let _chartTick = 0;
+
+async function tick() {
+  const d = await pollState();
+
+  // Update shared components
+  updateRunBar(d);
+  updatePipelineControls(d);
+
+  if (d) {
+    ps.textContent = 'live'; ps.className = 'poll-status ok';
+    document.getElementById('train-panels').className = 'visible';
+    setImg('render-img', 'render-ph', d.render_b64);
+    setImg('gt-img',     'gt-ph',     d.gt_b64);
+    setImg('diff-img',   'diff-ph',   d.diff_b64);
+    if (++_chartTick % 4 === 0) {
+      const history = await fetchHistory();
+      if (history.length) drawLossChart('loss-chart', history);
+    }
+  } else {
+    document.getElementById('train-panels').className = '';
+  }
+  await pollPipeline(); updatePills();
+}
+
+loadMosaic();
+tick();
+setInterval(tick, 500);
+setInterval(loadMosaic, 8000);
+</script>
+</body>
+</html>

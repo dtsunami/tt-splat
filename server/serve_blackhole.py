@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-Stand up the arcgs frontend/server on Blackhole, driving the Tenstorrent training backend.
+Stand up the ttgs frontend/server on Blackhole, driving the Tenstorrent training backend.
 
-Reuses arcgs's FastAPI dashboard + controllers UNCHANGED (imported as a library) and routes
-the training stage to our tt-splat pipeline (server/train_tt.py). arcgs source is NOT modified.
+Uses tt-splat's vendored ttgs FastAPI dashboard + controllers (forked from arcgs, lives in
+../ttgs) and routes the training stage to our tt-splat pipeline (server/train_tt.py).
 
   python server/serve_blackhole.py --dataset work/scene --output work/tt_out --port 7860
   # then open http://localhost:7860/training
@@ -14,13 +14,13 @@ Env knobs for the host-reference render budget: TT_MAX_POINTS, TT_SIZE.
 import argparse, os, sys
 from pathlib import Path
 
-sys.path.insert(0, "/home/starboy/arcgs")              # reuse arcgs as a library
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # train_tt
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # vendored ttgs package
+sys.path.insert(0, str(Path(__file__).resolve().parent))         # train_tt
 
-from arcgs.config import load as load_config
-from arcgs.backend.detect import Backend, BackendInfo
-from arcgs.viewer.dashboard import DashboardServer
-from arcgs.viewer.pipeline_controller import PipelineController
+from ttgs.config import load as load_config
+from ttgs.backend.detect import Backend, BackendInfo
+from ttgs.viewer.dashboard import DashboardServer
+from ttgs.viewer.pipeline_controller import PipelineController
 import train_tt
 
 
