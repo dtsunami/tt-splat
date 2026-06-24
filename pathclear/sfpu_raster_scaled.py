@@ -168,8 +168,13 @@ def main():
         grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(GX-1, GY-1))])
         ii, jj = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
         PXt = block_l1(dev, grid, W, H, jj.float()); PYt = block_l1(dev, grid, W, H, ii.float())
-        Ct = block_l1(dev, grid, W, H, torch.zeros(H, W)); Tt = block_l1(dev, grid, W, H, torch.ones(H, W))
+        acc = {"C": block_l1(dev, grid, W, H, torch.zeros(H, W)), "T": block_l1(dev, grid, W, H, torch.ones(H, W))}
         NB = TS*TS*4
+
+        def compute_cfg():
+            cfg = ttnn.ComputeConfigDescriptor()
+            cfg.fp32_dest_acc_en = True; cfg.math_approx_mode = False   # precision over batched accum
+            return cfg
 
         def params_for(t, d):
             lst = tile_lists[t][d*B:(d+1)*B]
@@ -195,25 +200,27 @@ def main():
                 for gy in range(GY):
                     sx_, sy_ = coords[(gx, gy)]; t = gy*ntx + gx
                     rt_r[gx][gy] = [sx_, sy_, PXt.buffer_address(), PYt.buffer_address(),
-                                    Ct.buffer_address(), Tt.buffer_address(), NB]
+                                    acc["C"].buffer_address(), acc["T"].buffer_address(), NB]
                     rt_c[gx][gy] = params_for(t, d)
-                    rt_w[gx][gy] = [sx_, sy_, Ct.buffer_address(), Tt.buffer_address(), NB]
+                    rt_w[gx][gy] = [sx_, sy_, acc["C"].buffer_address(), acc["T"].buffer_address(), NB]
             mk = lambda src, rt, cfg, cta=[]: ttnn.KernelDescriptor(
                 kernel_source=src, source_type=ttnn.KernelDescriptor.SourceType.SOURCE_CODE,
                 core_ranges=grid, runtime_args=rt, compile_time_args=cta, config=cfg)
             prog = ttnn.ProgramDescriptor(kernels=[
                 mk(READER, rt_r, ttnn.ReaderConfigDescriptor()),
-                mk(COMPUTE, rt_c, ttnn.ComputeConfigDescriptor(), [B]),
+                mk(COMPUTE, rt_c, compute_cfg(), [B]),
                 mk(WRITER, rt_w, ttnn.WriterConfigDescriptor())], semaphores=[], cbs=[cbf(i) for i in (0, 1, 2, 3, 16, 17)])
-            ttnn.generic_op([PXt, Ct], prog)
+            ttnn.generic_op([PXt, acc["C"]], prog)
 
+        for d in range(nbatch): dispatch(d)              # warmup: JIT-compile the kernels
+        acc["C"] = block_l1(dev, grid, W, H, torch.zeros(H, W))   # reset accumulators
+        acc["T"] = block_l1(dev, grid, W, H, torch.ones(H, W))
         t0 = time.perf_counter()
-        for d in range(nbatch):
-            dispatch(d)
-        _ = ttnn.to_torch(Ct)[0, 0, 0, 0]
+        for d in range(nbatch): dispatch(d)
+        _ = ttnn.to_torch(acc["C"])[0, 0, 0, 0]
         dt = time.perf_counter() - t0
 
-        got = ttnn.to_torch(Ct).reshape(H, W)
+        got = ttnn.to_torch(acc["C"]).reshape(H, W)
         gold = golden_culled(cx, cy, op, col, abc, tile_lists, W, H, ntx)
         mse = float(((got-gold)**2).mean()); psnr = 10*math.log10(float(gold.max())**2/max(mse, 1e-12))
         print(f"validate vs host-culled golden  MSE={mse:.3e}  PSNR={psnr:.1f} dB  -> {'OK' if mse < 1e-4 else 'FAIL'}")

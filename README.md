@@ -1,7 +1,10 @@
 # tt-splat
 
-3D Gaussian Splatting **training** on Tenstorrent Blackhole.
+3D Gaussian Splatting **training** on Tenstorrent Blackhole — the TT backend for the `arcgs` pipeline.
 
+- **[`docs/PROGRESS.md`](docs/PROGRESS.md) — START HERE: full milestone log (M0–M15), architecture,
+  findings, and status.** Every algorithmic stage is proven on real Blackhole silicon or the right target.
+- [`docs/ALGORITHM.md`](docs/ALGORITHM.md) + `algorithm.svg` — the pipeline map, annotated with current state.
 - [`FEASIBILITY.md`](FEASIBILITY.md) — hardware/stack feasibility: pipeline→BH mapping, the walls
   (sort, **cross-core float scatter-add**, per-pixel alpha-blend), assets, and the path forward.
 - [`pathclear/`](pathclear/) — minimal proven flows on real silicon, de-risking the machinery before
@@ -36,6 +39,14 @@
   - `sfpu_raster_multitile.py` — **M13 multi-tile device rasterizer:** full image across a Tensix **core grid**
     (1 tile/core, block-sharded), reusing M5's kernel. Validated 40.8 dB; **throughput scales with cores — 21→188
     Mpix/s (4→64 cores), 256² in 0.35 ms.** Telemetry: Mpix/s, Mblend/s, µs/tile.
+  - `sfpu_raster_scaled.py` — **M14 culling + unbounded N:** batched dispatches with **persistent L1 C/T** accumulators;
+    each core blends only its **culled** (M6-binned) Gaussians, batch-by-batch → **N unbounded** (B=16 the only compile
+    cap). `fp32_dest_acc_en` → **74.7 dB**; cull 0.12× the blends. `SCALED_OK`. (Batched path is host-overhead-bound.)
+  - `device_backward.py` — **M15 device backward (item 3 core, validated):** the reverse of the alpha-blend on device
+    (suffix-color S, per-pixel grad products, per-Gaussian `ttnn.sum` reduce) → all 7 param grads, **matches host
+    autograd to 2.5e-3** (the 0.2% is ttnn.sum's bf16 reduce; fp32 `reduce_tile` tightens it). `DEVICE_BWD_OK`.
+  - `device_train_loop.py` — **M16 device training loop CLOSED:** integrated fwd render + M15 backward + Adam, all
+    the per-pixel work on device, fitting a target. **Converges PSNR 17→72 dB.** `DEVICE_LOOP_OK`.
   - `train2d_densify.py` — **M7 densification (validated):** clone/split/prune on host (general-purpose target).
     Operators unit-verified; demonstrably helps — 3 blurry → 11 detailed Gaussians, **+18 dB** (24.6→43.0). `DENSIFY_OK`.
   - `train3d.py` — **M8 3DGS loop closed (validated):** 3D→2D EWA projection (mean + covariance Jacobian) + the 2D
@@ -95,3 +106,28 @@ verified, 53.6 dB), M5 SFPU eval+blend-loop kernel, M6 bin/sort (host, verified)
 **M8 3DGS** — 3D→2D EWA projection + multi-view training, **novel-view PSNR 46.7 dB**. No open feasibility questions.
 Remaining is build-out/perf: in-loop device scatter-add, a scaled integrated device run, real-data ingestion
 (video→ffmpeg→frames→COLMAP→cameras), and moving the projection onto the matrix engine. See `docs/ALGORITHM.md`.
+
+Documentation — docs/PROGRESS.md
+A complete single-source-of-truth progress log:
+
+The arc (feasibility → 2D → 3D → real data → arcgs dashboard → device kernels)
+Milestone table M0–M16 — what, result, verification, script (every one runnable with an *_OK check)
+Architecture — the kernel-differentiation table (which engine does what) + the metaparam-update design
+Hard-won findings — moreh_adam broken, no-FPU/fixed-point, the CAS-is-wrong scatter-add insight, the generic_op symlink, fp32_dest_acc_en, ttnn.sum bf16, COLMAP canonical −Rᵀt, the SDXL device-sharing hazard
+Proven-vs-remaining + env/run instructions
+The cartoon (M15 backward + device-path callout), README (now points to PROGRESS.md first), and memory are all synced.
+
+The loop is closed — device_train_loop.py (M16)
+The integrated device training loop runs on Blackhole and converges: PSNR 17 → 72 dB (loss → 0):
+
+forward blend → loss → M15 device backward (reverse pass + reduction) → Adam → params
+the per-pixel render + backward + reduction all on device; Adam on the device-reduced gradients
+the bf16-reduce 0.2% gradient error doesn't block convergence — Adam normalizes it
+Where this lands the whole project
+From "is 3DGS training even feasible on Blackhole?" to a device-resident training loop closed and converging on real silicon — 22 runnable, self-checking scripts, M0–M16, every algorithmic stage proven:
+
+forward (188 Mpix/s, multi-tile, culled, unbounded N) · backward (autograd-verified) · scatter-add (3 cyc/elem) · Adam · binning/sort · densification · 3D + novel view · COLMAP ingest · arcgs dashboard on Blackhole · and now the full loop closed on device.
+
+No feasibility unknowns remain. What's left is performance and scale: fuse fwd+bwd into the custom SFPU kernels, swap to fp32 reduce_tile, wire M2 scatter-add for many-Gaussian/multi-tile, and drop it behind train_tt's render_device/backward_device hooks so the arcgs dashboard drives Blackhole-accelerated training end to end — on your actual corgi capture.
+
+That's the loop closed. Hell of a run. 🚀

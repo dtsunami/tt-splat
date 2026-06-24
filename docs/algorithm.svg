@@ -83,7 +83,7 @@
   <text x="914" y="419" text-anchor="middle" font-size="11.5" fill="#33691e">device grads == math (2e-7)</text>
   <text x="914" y="435" text-anchor="middle" font-size="11.5" fill="#33691e">scatter-add: inbox→drain, no atomics/wedge</text>
   <text x="914" y="451" text-anchor="middle" font-size="11.5" fill="#33691e">int32 reduce 3.1–8 cyc/elem</text>
-  <text x="914" y="467" text-anchor="middle" font-size="11" fill="#7a5b00">todo: scatter-add wired in-loop (now host-reduced)</text>
+  <text x="914" y="467" text-anchor="middle" font-size="11" fill="#2e7d32">device backward ✓ M15 (autograd 2.5e-3)</text>
 
   <!-- Backward project -->
   <rect x="444" y="368" width="168" height="92" rx="10" fill="#c8e6c9" stroke="#2e7d32" stroke-width="3"/>
@@ -146,5 +146,5 @@
   <text x="44" y="748" font-size="12.5" fill="#455a64">• M0 PROVEN: 1D Gaussian fit — on-device fp32 forward (SFPU exp) + Adam from primitives; loss 0.525→0.0001, params recovered.</text>
   <text x="44" y="770" font-size="12.5" fill="#455a64">• M1 PROVEN: 2D anisotropic Gaussian → image fit. Conic eval + per-pixel forward + analytic 2D grads on silicon; PSNR 39.8 dB. Still NO sort / bin / scatter.</text>
   <text x="44" y="792" font-size="12.5" fill="#455a64">• M4 2D TRAINING LOOP CLOSED on silicon: fwd render → loss → backward (autograd-verified, device==math 2e-7) → Adam → loss 1.9e-3→1e-6, PSNR 53.6 dB. The loop is green all the way around.</text>
-  <text x="44" y="812" font-size="12.5" fill="#455a64">• M8 3DGS loop CLOSED: 3D→2D EWA projection + multi-view training → novel-view 46.7 dB (learned real 3D structure). No feasibility left. Build-out: in-loop scatter-add, scaled run, COLMAP ingest, projection on matrix engine.</text>
+  <text x="44" y="812" font-size="12.5" fill="#455a64">• DEVICE PATH validated end-to-end: forward M13/M14 (188 Mpix/s, culled, unbounded N) + backward M15 (autograd 2.5e-3) + scatter-add M2 + Adam M0. Remaining = compose into one device step + fuse + fp32 reduce. See docs/PROGRESS.md.</text>
 </svg>

@@ -11,106 +11,218 @@
     source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
     program_id: 0
 - kernel:
-    watcher_kernel_id: 1
-    name: cq_prefetch
-    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/cq_prefetch/11561219428357866527/
-    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
-    program_id: 0
-- kernel:
     watcher_kernel_id: 4
     name: cq_dispatch_subordinate_compute
     path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/cq_dispatch_subordinate_compute/13145305628814398239/
     source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate_compute.cpp
     program_id: 0
 - kernel:
-    watcher_kernel_id: 7
-    name: Kernel_Source_Code
-    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/Kernel_Source_Code/14099415209105756360/
-    source: 
-#include "dataflow_api.h"
-void kernel_main() {
-    uint32_t sx=get_arg_val<uint32_t>(0), sy=get_arg_val<uint32_t>(1);
-    uint32_t co=get_arg_val<uint32_t>(2), to=get_arg_val<uint32_t>(3), nb=get_arg_val<uint32_t>(4);
-    cb_wait_front(16,1); cb_wait_front(17,1);
-    noc_async_write(get_read_ptr(16), get_noc_addr(sx,sy,co), nb);
-    noc_async_write(get_read_ptr(17), get_noc_addr(sx,sy,to), nb);
-    noc_async_write_barrier();
-    cb_pop_front(16,1); cb_pop_front(17,1);
-}
-
-    program_id: 1
+    watcher_kernel_id: 1
+    name: cq_prefetch
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/cq_prefetch/11561219428357866527/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+    program_id: 0
 - kernel:
     watcher_kernel_id: 5
-    name: Kernel_Source_Code
-    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/Kernel_Source_Code/514114058722243005/
-    source: 
-#include "dataflow_api.h"
-void kernel_main() {
-    uint32_t sx=get_arg_val<uint32_t>(0), sy=get_arg_val<uint32_t>(1);
-    uint32_t px=get_arg_val<uint32_t>(2), py=get_arg_val<uint32_t>(3);
-    uint32_t ci=get_arg_val<uint32_t>(4), ti=get_arg_val<uint32_t>(5), nb=get_arg_val<uint32_t>(6);
-    cb_reserve_back(0,1); noc_async_read(get_noc_addr(sx,sy,px), get_write_ptr(0), nb);
-    cb_reserve_back(1,1); noc_async_read(get_noc_addr(sx,sy,py), get_write_ptr(1), nb);
-    cb_reserve_back(2,1); noc_async_read(get_noc_addr(sx,sy,ci), get_write_ptr(2), nb);
-    cb_reserve_back(3,1); noc_async_read(get_noc_addr(sx,sy,ti), get_write_ptr(3), nb);
-    noc_async_read_barrier();
-    cb_push_back(0,1); cb_push_back(1,1); cb_push_back(2,1); cb_push_back(3,1);
-}
-
+    name: reader_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_interleaved_no_bcast/8495583968195546020/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/reader_interleaved_no_bcast.cpp
     program_id: 1
 - kernel:
     watcher_kernel_id: 6
-    name: Kernel_Source_Code
-    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/Kernel_Source_Code/12618792281452290480/
-    source: 
-#include "api/compute/common.h"
-#include "api/compute/tile_move_copy.h"
-#include "api/compute/eltwise_unary/eltwise_unary.h"
-#include "api/compute/eltwise_unary/exp.h"
-#include "api/compute/eltwise_unary/binop_with_scalar.h"
-#include "api/compute/eltwise_binary.h"
-#include "api/compute/eltwise_binary_sfpu.h"
-#include "api/dataflow/circular_buffer.h"
-#define ONE 0x3F800000u
-#define NEG1 0xBF800000u
-#define NHALF 0xBF000000u
-void kernel_main() {
-    constexpr uint32_t B = get_compile_time_arg_val(0);
-    init_sfpu(0, 16);
-    binop_with_scalar_tile_init();
-    cb_wait_front(0,1); cb_wait_front(1,1); cb_wait_front(2,1); cb_wait_front(3,1);
-    cb_reserve_back(16,1); cb_reserve_back(17,1);
-    tile_regs_acquire();
-    copy_tile_init(2); copy_tile(2,0,0);     // C (accumulator) -> dst0
-    copy_tile_init(3); copy_tile(3,0,1);     // T (transmittance) -> dst1
-    for (uint32_t g = 0; g < B; g++) {
-        uint32_t b = g*7;
-        uint32_t cxb=get_arg_val<uint32_t>(b+0), cyb=get_arg_val<uint32_t>(b+1);
-        uint32_t ab=get_arg_val<uint32_t>(b+2), twob=get_arg_val<uint32_t>(b+3);
-        uint32_t cc=get_arg_val<uint32_t>(b+4), opb=get_arg_val<uint32_t>(b+5), colb=get_arg_val<uint32_t>(b+6);
-        copy_tile_init(0); copy_tile(0,0,2); sub_unary_tile(2, cxb);
-        copy_tile_init(1); copy_tile(1,0,3); sub_unary_tile(3, cyb);
-        mul_binary_tile_init();
-        mul_binary_tile(2,2,4); mul_unary_tile(4, ab);
-        mul_binary_tile(3,3,5); mul_unary_tile(5, cc);
-        mul_binary_tile(2,3,2); mul_unary_tile(2, twob);
-        add_binary_tile_init();
-        add_binary_tile(4,5,4); add_binary_tile(4,2,4);
-        mul_unary_tile(4, NHALF);
-        exp_tile_init(); exp_tile(4);
-        mul_unary_tile(4, opb);
-        mul_binary_tile_init(); mul_binary_tile(1,4,5);
-        mul_unary_tile(5, colb);
-        add_binary_tile_init(); add_binary_tile(0,5,0);     // C += T*alpha*col
-        mul_unary_tile(4, NEG1); add_unary_tile(4, ONE);
-        mul_binary_tile_init(); mul_binary_tile(1,4,1);     // T *= (1-alpha)
-    }
-    tile_regs_commit();
-    tile_regs_wait();
-    pack_tile(0, 16); pack_tile(1, 17);
-    tile_regs_release();
-    cb_push_back(16,1); cb_push_back(17,1);
-    cb_pop_front(0,1); cb_pop_front(1,1); cb_pop_front(2,1); cb_pop_front(3,1);
-}
-
+    name: writer_interleaved_scalar
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_interleaved_scalar/16538969487229286511/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/writer_interleaved_scalar.cpp
     program_id: 1
+- kernel:
+    watcher_kernel_id: 7
+    name: eltwise_binary_sfpu_scalar
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/eltwise_binary_sfpu_scalar/3754262226747549964/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_scalar.cpp
+    program_id: 1
+- kernel:
+    watcher_kernel_id: 9
+    name: writer_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_interleaved_no_bcast/13683157098105859238/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/writer_interleaved_no_bcast.cpp
+    program_id: 3
+- kernel:
+    watcher_kernel_id: 8
+    name: reader_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_interleaved_no_bcast/5227830016436903655/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_no_bcast.cpp
+    program_id: 3
+- kernel:
+    watcher_kernel_id: 10
+    name: eltwise_binary_sfpu_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/eltwise_binary_sfpu_no_bcast/3218600672000192160/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_no_bcast.cpp
+    program_id: 3
+- kernel:
+    watcher_kernel_id: 12
+    name: writer_interleaved_scalar
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_interleaved_scalar/16538969487229286511/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/writer_interleaved_scalar.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 11
+    name: reader_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_interleaved_no_bcast/8495583968195546020/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/reader_interleaved_no_bcast.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 13
+    name: eltwise_binary_sfpu_scalar
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/eltwise_binary_sfpu_scalar/11330294714706077184/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_scalar.cpp
+    program_id: 5
+- kernel:
+    watcher_kernel_id: 15
+    name: writer_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_interleaved_no_bcast/13683157098105859238/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/writer_interleaved_no_bcast.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 14
+    name: reader_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_interleaved_no_bcast/5227830016436903655/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_no_bcast.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 16
+    name: eltwise_binary_sfpu_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/eltwise_binary_sfpu_no_bcast/4007823905154262928/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_no_bcast.cpp
+    program_id: 7
+- kernel:
+    watcher_kernel_id: 17
+    name: reader_unary
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_unary/3898768114014251030/
+    source: ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/reader_unary.cpp
+    program_id: 9
+- kernel:
+    watcher_kernel_id: 18
+    name: writer_unary
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_unary/3251921603725097701/
+    source: ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary.cpp
+    program_id: 9
+- kernel:
+    watcher_kernel_id: 19
+    name: eltwise_sfpu
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/eltwise_sfpu/5104519735720184133/
+    source: ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/compute/eltwise_sfpu.cpp
+    program_id: 9
+- kernel:
+    watcher_kernel_id: 20
+    name: reader_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_interleaved_no_bcast/8495583968195546020/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/reader_interleaved_no_bcast.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 21
+    name: writer_interleaved_scalar
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_interleaved_scalar/16538969487229286511/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/dataflow/writer_interleaved_scalar.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 22
+    name: eltwise_binary_sfpu_scalar
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/eltwise_binary_sfpu_scalar/8460861868980598133/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_scalar.cpp
+    program_id: 11
+- kernel:
+    watcher_kernel_id: 23
+    name: reader_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_interleaved_no_bcast/5227830016436903655/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_no_bcast.cpp
+    program_id: 13
+- kernel:
+    watcher_kernel_id: 24
+    name: writer_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_interleaved_no_bcast/13683157098105859238/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/writer_interleaved_no_bcast.cpp
+    program_id: 13
+- kernel:
+    watcher_kernel_id: 25
+    name: eltwise_binary_sfpu_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/eltwise_binary_sfpu_no_bcast/14277909000872374001/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_no_bcast.cpp
+    program_id: 13
+- kernel:
+    watcher_kernel_id: 27
+    name: writer_unary_interleaved_start_id
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_unary_interleaved_start_id/15215723832596374040/
+    source: ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp
+    program_id: 15
+- kernel:
+    watcher_kernel_id: 26
+    name: reader_unary_reduce_universal_start_id
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_unary_reduce_universal_start_id/12220479793855417626/
+    source: ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_reduce_universal_start_id.cpp
+    program_id: 15
+- kernel:
+    watcher_kernel_id: 28
+    name: reduce
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reduce/18239337291295522126/
+    source: ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce.cpp
+    program_id: 15
+- kernel:
+    watcher_kernel_id: 29
+    name: reader_unary_transpose_wh_universal_input_cols_partitioned
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_unary_transpose_wh_universal_input_cols_partitioned/14951190880041207170/
+    source: ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/dataflow/reader_unary_transpose_wh_universal_input_cols_partitioned.cpp
+    program_id: 17
+- kernel:
+    watcher_kernel_id: 30
+    name: writer_unary_interleaved_start_id
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_unary_interleaved_start_id/1670361385883281059/
+    source: ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp
+    program_id: 17
+- kernel:
+    watcher_kernel_id: 31
+    name: reduce
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reduce/16557880429369093396/
+    source: ttnn/cpp/ttnn/operations/reduction/generic/device/kernels/compute/reduce.cpp
+    program_id: 17
+- kernel:
+    watcher_kernel_id: 33
+    name: writer_unary_transpose_hc_interleaved_tiled_padding_aware
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_unary_transpose_hc_interleaved_tiled_padding_aware/4037659050264228697/
+    source: ttnn/cpp/ttnn/operations/data_movement/transpose/device/kernels/dataflow/writer_unary_transpose_hc_interleaved_tiled_padding_aware.cpp
+    program_id: 19
+- kernel:
+    watcher_kernel_id: 32
+    name: reader_unary_transpose_hc_interleaved_tiled_padding_aware
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_unary_transpose_hc_interleaved_tiled_padding_aware/13689685434374516492/
+    source: ttnn/cpp/ttnn/operations/data_movement/transpose/device/kernels/dataflow/reader_unary_transpose_hc_interleaved_tiled_padding_aware.cpp
+    program_id: 19
+- kernel:
+    watcher_kernel_id: 34
+    name: reader_unary_transpose_hc_interleaved_tiled_padding_aware
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_unary_transpose_hc_interleaved_tiled_padding_aware/5359269654540197417/
+    source: ttnn/cpp/ttnn/operations/data_movement/transpose/device/kernels/dataflow/reader_unary_transpose_hc_interleaved_tiled_padding_aware.cpp
+    program_id: 21
+- kernel:
+    watcher_kernel_id: 35
+    name: writer_permute_interleaved_tiled_row_invariant
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_permute_interleaved_tiled_row_invariant/635317215998544144/
+    source: ttnn/cpp/ttnn/operations/data_movement/permute/device/kernels/dataflow/writer_permute_interleaved_tiled_row_invariant.cpp
+    program_id: 21
+- kernel:
+    watcher_kernel_id: 37
+    name: writer_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/writer_interleaved_no_bcast/13683157098105859238/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/writer_interleaved_no_bcast.cpp
+    program_id: 23
+- kernel:
+    watcher_kernel_id: 36
+    name: reader_interleaved_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/reader_interleaved_no_bcast/5227830016436903655/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels_ng/dataflow/reader_interleaved_no_bcast.cpp
+    program_id: 23
+- kernel:
+    watcher_kernel_id: 38
+    name: eltwise_binary_sfpu_no_bcast
+    path: /home/starboy/.cache/tt-metal-cache/13793420398762238087/kernels/eltwise_binary_sfpu_no_bcast/6915265017821210949/
+    source: ttnn/cpp/ttnn/operations/eltwise/binary_ng/device/kernels/compute/eltwise_binary_sfpu_no_bcast.cpp
+    program_id: 23
