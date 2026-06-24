@@ -1,8 +1,15 @@
-build/
-generated/
-work/*
-!work/scene/          # keep the sample dataset the quickstart needs
+# Python
 **/__pycache__/
 *.pyc
-*.egg-info/           # pip install -e . creates ttgs.egg-info
+*.egg-info/
 .venv/
+
+# Build / generated artifacts
+build/
+generated/
+
+# work/: keep the input dataset (scene model + source frames), ignore training outputs.
+# NOTE: keep these as own-line comments — gitignore does NOT support inline comments.
+work/*
+!work/scene
+!work/frames
