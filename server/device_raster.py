@@ -132,7 +132,7 @@ class DeviceRaster(torch.autograd.Function):
         geomg = {k: np.zeros(N, np.float64) for k in ("cx", "cy", "a", "b", "c", "op")}
         colg = [np.zeros(N, np.float64) for _ in range(3)]
         if not ctx.empty:
-            from fused_backward import fused_backward
+            from fused_backward import fused_backward_grid
             dev = _device()
             gi = grad_img.detach().cpu().numpy().astype(np.float64)
             tl, ntx, Tfin, vidx = ctx.tile_lists, ctx.ntx, ctx.Tfin, ctx.vidx
@@ -140,27 +140,12 @@ class DeviceRaster(torch.autograd.Function):
             if gi.shape[0] != Hp or gi.shape[1] != Wp:        # image may be non-32-multiple -> zero-pad
                 g2 = np.zeros((Hp, Wp, 3), np.float64); g2[:gi.shape[0], :gi.shape[1], :] = gi; gi = g2
             cxv, cyv, av, bv, cv, opv, colv = ctx.cxv, ctx.cyv, ctx.av, ctx.bv, ctx.cv, ctx.opv, ctx.colv
-            CHUNK = 16                                        # bound per-dispatch output to L1
-            for t, lst in enumerate(tl):
-                if not lst:
-                    continue                                  # CULLED: empty tiles do no work
-                ty, tx = divmod(t, ntx); oy, ox = ty*32, tx*32
-                rev = lst[::-1]                               # back-to-front = kernel reverse-pass order
-                Tfin_tile = Tfin[oy:oy+32, ox:ox+32]
-                for k in range(3):
-                    dl = torch.from_numpy(gi[oy:oy+32, ox:ox+32, k].copy())
-                    S_cur, T_cur = None, torch.from_numpy(Tfin_tile.copy())   # chunk-threaded S/T_run
-                    for cs in range(0, len(rev), CHUNK):
-                        chunk = rev[cs:cs + CHUNK]
-                        params = [{"cx": cxv[i], "cy": cyv[i], "a": av[i], "b": bv[i], "c": cv[i],
-                                   "op": opv[i], "col": colv[k][i]} for i in chunk]
-                        g, S_cur, T_cur = fused_backward(dev, params, dl, T_cur, ox=ox, oy=oy,
-                                                         S_init=S_cur, return_state=True)
-                        for j, i in enumerate(chunk):
-                            gid = vidx[i]                     # valid-subset -> original Gaussian index
-                            for key in ("cx", "cy", "a", "b", "c", "op"):
-                                geomg[key][gid] += float(g[key][j])
-                            colg[k][gid] += float(g["col"][j])
+            # STAGE A: grid-sharded backward — ONE dispatch per (chunk,channel), all tiles parallel
+            gv, cgv = fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tl, ntx, Hp // 32, Wp, Hp, gi, Tfin)
+            for key in ("cx", "cy", "a", "b", "c", "op"):
+                geomg[key][vidx] = gv[key]                    # valid-subset -> original Gaussian index
+            for k in range(3):
+                colg[k][vidx] = cgv[k]
         tt = lambda arr: torch.from_numpy(arr).to(ctx.in_dtype)
         return (tt(geomg["cx"]), tt(geomg["cy"]), tt(geomg["a"]), tt(geomg["b"]), tt(geomg["c"]),
                 tt(geomg["op"]), tt(colg[0]), tt(colg[1]), tt(colg[2]), None, None, None)

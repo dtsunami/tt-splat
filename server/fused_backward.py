@@ -37,6 +37,96 @@ READER, COMPUTE, WRITER = _g["READER"], _g["COMPUTE"], _g["WRITER"]
 _NAMES = ["col", "op", "a", "c", "b", "cx", "cy"]   # CB pack order 16..22
 
 
+def _block(dev, grid, totH, totW, shard_h, data=None):
+    sh = ttnn.ShardSpec(grid, [shard_h, TS], ttnn.ShardOrientation.ROW_MAJOR)
+    mc = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.BLOCK_SHARDED, ttnn.BufferType.L1, sh)
+    if data is None:
+        return ttnn.allocate_tensor_on_device(ttnn.Shape([1, 1, totH, totW]), ttnn.float32, ttnn.TILE_LAYOUT, dev, mc)
+    return ttnn.from_torch(data.reshape(1, 1, totH, totW).float(), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT,
+                           device=dev, memory_config=mc)
+
+
+def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, nty, Wp, Hp, gi, Tfin):
+    """STAGE A — grid-sharded backward: ONE dispatch per (chunk, channel), all tiles parallel (vs the
+    host-tile-loop). Block-shard PX/PY/dLdC/T/S per tile; each core runs the m17 kernel on its tile's
+    chunk of <=FUSED_K Gaussians; S/T threaded across chunks as on-device block-sharded tensors. Products
+    drain per chunk -> host accumulate. Returns geomg{}, colg[3] over the valid Gaussian indexing."""
+    GX, GY = ntx, nty
+    N = cxv.shape[0]
+    geomg = {k: __import__("numpy").zeros(N) for k in ("cx", "cy", "a", "b", "c", "op")}
+    import numpy as np
+    colg = [np.zeros(N) for _ in range(3)]
+    maxc = max((len(l) for l in tile_lists), default=0)
+    if maxc == 0:
+        return geomg, colg
+    nbatch = (maxc + FUSED_K - 1) // FUSED_K
+    grid = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(GX - 1, GY - 1))])
+    ii, jj = torch.meshgrid(torch.arange(Hp), torch.arange(Wp), indexing="ij")
+    PXt = _block(dev, grid, Hp, Wp, TS, jj.float())
+    PYt = _block(dev, grid, Hp, Wp, TS, ii.float())
+    coords = {(gx, gy): (lambda hp: (hp.x, hp.y))(dev.worker_core_from_logical_core(ttnn.CoreCoord(gx, gy)))
+              for gx in range(GX) for gy in range(GY)}
+    NB = TS * TS * 4
+    SHF = FUSED_K * TS                                                  # output shard height (FUSED_K tiles)
+    cbf = lambda i, d: ttnn.CBDescriptor(total_size=d * NB, core_ranges=grid,
+             format_descriptors=[ttnn.CBFormatDescriptor(buffer_index=i, data_format=ttnn.float32, page_size=NB)])
+    ks = lambda s, rt, cfg, cta=[]: ttnn.KernelDescriptor(
+        kernel_source=s, source_type=ttnn.KernelDescriptor.SourceType.SOURCE_CODE,
+        core_ranges=grid, runtime_args=rt, compile_time_args=cta, config=cfg)
+
+    def tile_chunk(t, c):    # tile t's Gaussians [c*K:(c+1)*K] padded to FUSED_K, in REVERSE order
+        lst = tile_lists[t][::-1][c * FUSED_K:(c + 1) * FUSED_K]
+        return lst, lst + [None] * (FUSED_K - len(lst))
+
+    for k in range(3):
+        dLt = _block(dev, grid, Hp, Wp, TS, torch.from_numpy(gi[:, :, k].copy()))
+        Tt = _block(dev, grid, Hp, Wp, TS, torch.from_numpy(Tfin.copy()))
+        St = _block(dev, grid, Hp, Wp, TS, torch.zeros(Hp, Wp))
+        for c in range(nbatch):
+            outs = [_block(dev, grid, GY * SHF, Wp, SHF) for _ in range(7)]
+            Sout = _block(dev, grid, Hp, Wp, TS)
+            Tout = _block(dev, grid, Hp, Wp, TS)
+            rt_r, rt_c, rt_w = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+            for gx in range(GX):
+                for gy in range(GY):
+                    sx, sy = coords[(gx, gy)]; t = gy * ntx + gx
+                    _, padded = tile_chunk(t, c)
+                    rt_r[gx][gy] = [sx, sy, PXt.buffer_address(), PYt.buffer_address(), dLt.buffer_address(),
+                                    Tt.buffer_address(), St.buffer_address(), NB, FUSED_K,
+                                    Sout.buffer_address(), Tout.buffer_address()]
+                    cargs = []
+                    for i in padded:
+                        q = (_DUMMY_G if i is None else
+                             {"cx": cxv[i], "cy": cyv[i], "a": av[i], "b": bv[i], "c": cv[i], "op": opv[i], "col": colv[k][i]})
+                        cargs += [f2u(q["cx"]), f2u(q["cy"]), f2u(q["a"]), f2u(2 * q["b"]), f2u(q["c"]),
+                                  f2u(q["op"]), f2u(q["col"]), f2u(q["b"])]
+                    rt_c[gx][gy] = cargs
+                    rt_w[gx][gy] = [sx, sy, FUSED_K, NB] + [o.buffer_address() for o in outs]
+            prog = ttnn.ProgramDescriptor(kernels=[
+                ks(READER, rt_r, ttnn.ReaderConfigDescriptor()),
+                ks(COMPUTE, rt_c, ttnn.ComputeConfigDescriptor(), [FUSED_K]),
+                ks(WRITER, rt_w, ttnn.WriterConfigDescriptor())],
+                semaphores=[], cbs=[cbf(i, 2) for i in (0, 1, 2, 24, 25, 26, 27)] + [cbf(i, 3) for i in range(16, 23)])
+            ttnn.generic_op([PXt, outs[0]], prog)
+            host = [ttnn.to_torch(o).reshape(GY * SHF, Wp) for o in outs]   # [GY*FK*32, GX*32]
+            for gx in range(GX):
+                for gy in range(GY):
+                    t = gy * ntx + gx
+                    lst, _ = tile_chunk(t, c)
+                    if not lst:
+                        continue
+                    for gi_i, name in enumerate(_NAMES):
+                        shard = host[gi_i][gy * SHF:(gy + 1) * SHF, gx * TS:(gx + 1) * TS].reshape(FUSED_K, TS, TS)
+                        s = shard.reshape(FUSED_K, -1).sum(dim=1)
+                        for j, idx in enumerate(lst):
+                            if name in ("cx", "cy", "a", "b", "c", "op"):
+                                geomg[{"cx": "cx", "cy": "cy", "a": "a", "b": "b", "c": "c", "op": "op"}[name]][idx] += float(s[j])
+                            else:
+                                colg[k][idx] += float(s[j])
+            St, Tt = Sout, Tout
+    return geomg, colg
+
+
 def _l1(dev, data=None, nt=1):
     crs = ttnn.CoreRangeSet([ttnn.CoreRange(ttnn.CoreCoord(*HOME), ttnn.CoreCoord(*HOME))])
     mc = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1,
