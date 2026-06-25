@@ -31,11 +31,9 @@ USE_DEVICE_TRAIN = int(os.environ.get("TT_DEVICE_TRAIN", "0"))    # fwd+bwd GRAD
 _render_device = None                                             # lazy: imports ttnn only when enabled
 _render_train = None
 
-if USE_DEVICE_TRAIN:                                              # correctness path is O(N) ttnn-ops → small scale
-    HOST_MAX_POINTS = min(HOST_MAX_POINTS or 16, 16)
-    HOST_SIZE = min(HOST_SIZE, 64)
-    print(f"device TRAIN enabled — capping to {HOST_MAX_POINTS} Gaussians @ {HOST_SIZE}px "
-          "(correctness path; perf kernel = Phase 2b)")
+if USE_DEVICE_TRAIN:    # M14 fused forward + culled chunked fused backward → scales past the old 16/64 cap
+    print(f"device TRAIN enabled — M14 fused forward + culled fused backward, "
+          f"{HOST_MAX_POINTS} Gaussians @ {HOST_SIZE}px (backward is host-tile-looped; lower if too slow)")
 
 
 def _train_render(P, cam, H, W, PX, PY):

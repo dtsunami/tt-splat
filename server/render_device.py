@@ -73,8 +73,9 @@ def _resources(dev, Wp, Hp):
     return _CACHE[key]
 
 
-def _raster_channel(dev, res, tile_lists, ntx, nbatch, cx, cy, ca, cb, cc, op, colch, Wp, Hp):
-    """One scalar-color device raster pass (the M14 batched dispatch) -> (Hp,Wp) numpy."""
+def _raster_channel(dev, res, tile_lists, ntx, nbatch, cx, cy, ca, cb, cc, op, colch, Wp, Hp, want_T=False):
+    """One scalar-color device raster pass (the M14 batched dispatch) -> (Hp,Wp) numpy.
+    want_T=True also returns the final transmittance T (geometry-only, same across channels)."""
     GX, GY, grid = res["GX"], res["GY"], res["grid"]
     PXt, PYt, coords = res["PXt"], res["PYt"], res["coords"]
     TS, Bb = M14.TS, M14.B
@@ -124,8 +125,9 @@ def _raster_channel(dev, res, tile_lists, ntx, nbatch, cx, cy, ca, cb, cc, op, c
     for d in range(nbatch):
         dispatch(d)
     out = ttnn.to_torch(accC).reshape(Hp, Wp).numpy().copy()
+    T = ttnn.to_torch(accT).reshape(Hp, Wp).numpy().copy() if want_T else None
     accC.deallocate(); accT.deallocate()
-    return out
+    return (out, T) if want_T else out
 
 
 def render_device(P, cam, H, W) -> np.ndarray:

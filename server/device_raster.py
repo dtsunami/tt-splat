@@ -22,7 +22,9 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "docs" / "pathclear"))
 import ttnn                                            # noqa: E402
 from train_real import project_general, sh_eval        # noqa: E402
-from render_device import _device                      # noqa: E402  persistent device handle + preflight
+from render_device import _device, _resources, _raster_channel   # noqa: E402  M14 forward (image + final-T)
+from bin_sort import bin_and_sort                       # noqa: E402  M6 per-tile cull + depth sort
+import sfpu_raster_scaled as M14                         # noqa: E402  TS, B
 
 KEYS = ("cx", "cy", "a", "b", "c", "op", "col")
 _CTX: dict = {}                                        # (H,W) -> cached pixel-coord tensors + helpers
@@ -54,7 +56,7 @@ def _fwd(ct, p, order, store):
             rec.append((i, dx, dy, gexp, alpha, T))
         C = ttnn.add(C, ttnn.mul(ttnn.mul(T, alpha), col))
         T = ttnn.mul(T, ttnn.add(ttnn.mul(alpha, -1.0), 1.0))
-    return C, rec
+    return C, rec, T          # T = final transmittance (fused backward needs it)
 
 
 def _bwd(ct, p, rec, dLdC, N):
@@ -80,40 +82,85 @@ def _bwd(ct, p, rec, dLdC, N):
 
 
 class DeviceRaster(torch.autograd.Function):
-    """Differentiable on-device RGB rasterizer. forward = 3 ttnn blend passes (one per channel, shared
-    geometry); backward = M16 reverse pass per channel, geometry grads summed across channels."""
+    """On-device RGB rasterizer. FORWARD = M14 fused multi-tile CULLED rasterizer (image + final-T,
+    via M6 per-tile depth-sorted lists). BACKWARD = the fused backward kernel run per tile over the
+    SAME culled lists, host-accumulated. Grads are w.r.t. the 2D Gaussian params; the caller backprops
+    them through projection/SH to P. Replaces the old O(N) ttnn-op fwd/bwd (Phase 2b items 1+2)."""
 
     @staticmethod
-    def forward(ctx, cx, cy, a, b, c, op, colR, colG, colB, order, H, W):
+    def forward(ctx, cx, cy, a, b, c, op, colR, colG, colB, zc, H, W):
         dev = _device()
-        ct = _ctx(dev, H, W)
-        geom = {k: t.detach().cpu().numpy().astype(np.float64)
-                for k, t in zip(("cx", "cy", "a", "b", "c", "op"), (cx, cy, a, b, c, op))}
-        cols = [t.detach().cpu().numpy().astype(np.float64) for t in (colR, colG, colB)]
-        order = [int(i) for i in order]
-        imgs, recs = [], []
-        for colk in cols:
-            p = dict(geom); p["col"] = colk
-            C, rec = _fwd(ct, p, order, store=True)
-            imgs.append(ttnn.to_torch(C).reshape(H, W))
-            recs.append(rec)
-        ctx.ct, ctx.geom, ctx.cols, ctx.order, ctx.recs = ct, geom, cols, order, recs
-        ctx.N, ctx.in_dtype = len(geom["cx"]), cx.dtype
-        return torch.stack(imgs, dim=-1).to(cx.dtype)         # [H,W,3]
+        np64 = lambda t: t.detach().cpu().numpy().astype(np.float64)
+        cxn, cyn, an, bn, cn, opn, zcn = map(np64, (cx, cy, a, b, c, op, zc))
+        cols = [np64(colR), np64(colG), np64(colB)]
+        N = cxn.shape[0]
+        TS = M14.TS
+        Wp, Hp = ((W + TS - 1)//TS)*TS, ((H + TS - 1)//TS)*TS
+        valid = zcn > 1e-4                                    # cull behind-camera
+        vidx = np.nonzero(valid)[0]
+        ctx.N, ctx.in_dtype = N, cx.dtype
+        if vidx.size == 0:
+            ctx.empty = True
+            return torch.zeros(H, W, 3, dtype=cx.dtype)
+        cxv, cyv, av, bv, cv, opv, zcv = (arr[valid] for arr in (cxn, cyn, an, bn, cn, opn, zcn))
+        colv = [cl[valid] for cl in cols]
+        detc = av*cv - bv*bv; detc = np.where(np.abs(detc) < 1e-12, 1e-12, detc)
+        var_x = np.clip(cv/detc, 0.25, None); var_y = np.clip(av/detc, 0.25, None)   # 2D variance from conic
+        res = _resources(dev, Wp, Hp)
+        s_gid, _st, ranges, ntx, nty, _tot = bin_and_sort(cxv, cyv, var_x, var_y, zcv, Wp, Hp, ts=TS)  # M6
+        tile_lists = [s_gid[ranges[t, 0]:ranges[t, 1]].tolist() for t in range(ntx*nty)]
+        maxc = max((len(l) for l in tile_lists), default=0)
+        nbatch = (maxc + M14.B - 1)//M14.B
+        chans, Tfin = [], None
+        for k in range(3):
+            r = _raster_channel(dev, res, tile_lists, ntx, nbatch, cxv, cyv, av, bv, cv, opv, colv[k],
+                                Wp, Hp, want_T=(k == 0))     # M14 fused forward; final-T from ch0 (geometry-only)
+            if k == 0:
+                Ck, Tfin = r
+            else:
+                Ck = r
+            chans.append(Ck)
+        img = np.stack(chans, axis=-1)[:H, :W, :]
+        ctx.empty = False
+        ctx.tile_lists, ctx.ntx, ctx.Tfin, ctx.vidx = tile_lists, ntx, Tfin, vidx
+        ctx.cxv, ctx.cyv, ctx.av, ctx.bv, ctx.cv, ctx.opv, ctx.colv = cxv, cyv, av, bv, cv, opv, colv
+        return torch.from_numpy(np.clip(img, 0.0, 1.0)).to(cx.dtype)
 
     @staticmethod
     def backward(ctx, grad_img):                              # grad_img [H,W,3]
-        ct, N = ctx.ct, ctx.N
-        gi = grad_img.detach().cpu().numpy().astype(np.float64)
+        N = ctx.N
         geomg = {k: np.zeros(N, np.float64) for k in ("cx", "cy", "a", "b", "c", "op")}
         colg = [np.zeros(N, np.float64) for _ in range(3)]
-        for k in range(3):
-            p = dict(ctx.geom); p["col"] = ctx.cols[k]
-            dLdC = ct["dt"](torch.from_numpy(gi[:, :, k].copy()))
-            g = _bwd(ct, p, ctx.recs[k], dLdC, N)
-            for key in ("cx", "cy", "a", "b", "c", "op"):
-                geomg[key] += g[key]
-            colg[k] = g["col"]
+        if not ctx.empty:
+            from fused_backward import fused_backward
+            dev = _device()
+            gi = grad_img.detach().cpu().numpy().astype(np.float64)
+            tl, ntx, Tfin, vidx = ctx.tile_lists, ctx.ntx, ctx.Tfin, ctx.vidx
+            Hp, Wp = Tfin.shape                               # padded tile grid
+            if gi.shape[0] != Hp or gi.shape[1] != Wp:        # image may be non-32-multiple -> zero-pad
+                g2 = np.zeros((Hp, Wp, 3), np.float64); g2[:gi.shape[0], :gi.shape[1], :] = gi; gi = g2
+            cxv, cyv, av, bv, cv, opv, colv = ctx.cxv, ctx.cyv, ctx.av, ctx.bv, ctx.cv, ctx.opv, ctx.colv
+            CHUNK = 16                                        # bound per-dispatch output to L1
+            for t, lst in enumerate(tl):
+                if not lst:
+                    continue                                  # CULLED: empty tiles do no work
+                ty, tx = divmod(t, ntx); oy, ox = ty*32, tx*32
+                rev = lst[::-1]                               # back-to-front = kernel reverse-pass order
+                Tfin_tile = Tfin[oy:oy+32, ox:ox+32]
+                for k in range(3):
+                    dl = torch.from_numpy(gi[oy:oy+32, ox:ox+32, k].copy())
+                    S_cur, T_cur = None, torch.from_numpy(Tfin_tile.copy())   # chunk-threaded S/T_run
+                    for cs in range(0, len(rev), CHUNK):
+                        chunk = rev[cs:cs + CHUNK]
+                        params = [{"cx": cxv[i], "cy": cyv[i], "a": av[i], "b": bv[i], "c": cv[i],
+                                   "op": opv[i], "col": colv[k][i]} for i in chunk]
+                        g, S_cur, T_cur = fused_backward(dev, params, dl, T_cur, ox=ox, oy=oy,
+                                                         S_init=S_cur, return_state=True)
+                        for j, i in enumerate(chunk):
+                            gid = vidx[i]                     # valid-subset -> original Gaussian index
+                            for key in ("cx", "cy", "a", "b", "c", "op"):
+                                geomg[key][gid] += float(g[key][j])
+                            colg[k][gid] += float(g["col"][j])
         tt = lambda arr: torch.from_numpy(arr).to(ctx.in_dtype)
         return (tt(geomg["cx"]), tt(geomg["cy"]), tt(geomg["a"]), tt(geomg["b"]), tt(geomg["c"]),
                 tt(geomg["op"]), tt(colg[0]), tt(colg[1]), tt(colg[2]), None, None, None)
@@ -121,7 +168,7 @@ class DeviceRaster(torch.autograd.Function):
 
 def render_train(P, cam, H, W) -> torch.Tensor:
     """Differentiable on-device render of P from camera `cam` -> [H,W,3] torch (grad flows to P).
-    Drop-in for train_real.render in the training loss path when TT_DEVICE_TRAIN is on."""
+    M14 fused culled forward + fused culled backward. Drop-in for train_real.render under TT_DEVICE_TRAIN."""
     Rv, tv, fx, fy, ppx, ppy = cam[:6]
     u, v, zc, (ca, cb, cc) = project_general(P, Rv, tv, fx, fy, ppx, ppy)   # differentiable (float64)
     cam_center = -Rv.T @ tv
@@ -129,8 +176,6 @@ def render_train(P, cam, H, W) -> torch.Tensor:
     dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-9)
     col = sh_eval(P["sh"], dirs, P["deg"])                 # [N,3]
     op = torch.sigmoid(P["op"])
-    zc_d = zc.detach()
-    order = [int(i) for i in torch.argsort(zc_d).tolist() if float(zc_d[i]) > 1e-4]   # cull behind-cam
     f = lambda t: t.float()
     return DeviceRaster.apply(f(u), f(v), f(ca), f(cb), f(cc), f(op),
-                              f(col[:, 0]), f(col[:, 1]), f(col[:, 2]), order, H, W)
+                              f(col[:, 0]), f(col[:, 1]), f(col[:, 2]), f(zc), H, W)
