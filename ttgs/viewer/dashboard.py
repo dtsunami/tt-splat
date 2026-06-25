@@ -736,10 +736,25 @@ class DashboardServer:
         server.stop()          # signal shutdown from another thread
     """
 
-    def __init__(self, pipeline, port: int = 7860) -> None:
+    def __init__(self, pipeline, port: int = 7860, host: str = "0.0.0.0") -> None:
         self._pipeline = pipeline
         self._port     = port
+        self._host     = host          # "0.0.0.0" = all interfaces; "127.0.0.1" = local-only
         self._server   = None
+
+    def _banner_url(self) -> str:
+        """URL to print. When bound to all interfaces, show the LAN IP so remote
+        clients know where to point; otherwise show the bound host."""
+        if self._host not in ("0.0.0.0", "::", ""):
+            return f"http://{self._host}:{self._port}"
+        import socket
+        ip = "localhost"
+        try:                                  # best-effort primary LAN IP (no traffic sent)
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close()
+        except Exception:
+            pass
+        return f"http://{ip}:{self._port}"
 
     @property
     def controller(self):
@@ -749,11 +764,11 @@ class DashboardServer:
     def run(self) -> None:
         import uvicorn
         app    = build_app(self._pipeline)
-        config = uvicorn.Config(app, host="0.0.0.0", port=self._port, log_level="error")
+        config = uvicorn.Config(app, host=self._host, port=self._port, log_level="error")
         self._server = uvicorn.Server(config)
-        url = f"http://localhost:{self._port}"
+        url = self._banner_url()
         console.print(f"[bold cyan]dashboard[/] [link={url}]{url}[/link]  "
-                      f"[dim]MCP → {url}/mcp[/dim]  Ctrl-C to stop")
+                      f"[dim](bound {self._host}:{self._port})  MCP → {url}/mcp[/dim]  Ctrl-C to stop")
         try:
             self._server.run()
         except KeyboardInterrupt:
@@ -773,7 +788,7 @@ class DashboardServer:
         exc_box:    list = []
 
         app    = build_app(self._pipeline)
-        config = uvicorn.Config(app, host="0.0.0.0", port=self._port,
+        config = uvicorn.Config(app, host=self._host, port=self._port,
                                 log_level="error")
         server = uvicorn.Server(config)
         self._server = server
@@ -789,9 +804,9 @@ class DashboardServer:
         t = threading.Thread(target=_train, daemon=False, name="ttgs-training")
         t.start()
 
-        url = f"http://localhost:{self._port}"
+        url = self._banner_url()
         console.print(f"[bold cyan]dashboard[/] [link={url}]{url}[/link]  "
-                      f"[dim]MCP → {url}/mcp[/dim]")
+                      f"[dim](bound {self._host}:{self._port})  MCP → {url}/mcp[/dim]")
         try:
             server.run()
         except KeyboardInterrupt:

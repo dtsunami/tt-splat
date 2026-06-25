@@ -41,7 +41,9 @@ def main():
     ap.add_argument("--dataset", required=True, help="COLMAP dataset dir (sparse/0 + images/)")
     ap.add_argument("--output", default="work/tt_out")
     ap.add_argument("--port", type=int, default=7860)
-    ap.add_argument("--steps", type=int, default=2000)
+    ap.add_argument("--host", default="0.0.0.0",
+                    help="Interface to bind (default 0.0.0.0 = all IPs; use 127.0.0.1 for local-only)")
+    ap.add_argument("--steps", type=int, default=30000)
     a = ap.parse_args()
     dataset, output = Path(a.dataset), Path(a.output)
 
@@ -52,14 +54,19 @@ def main():
     print(f"backend: {backend}")
 
     frames = dataset / "images" if (dataset / "images").exists() else dataset
-    pc = PipelineController(output_dir=output, cfg=cfg, backend=backend, frames_dir=frames)
-    db = DashboardServer(pc, port=a.port)
-    print(f"dashboard: http://localhost:{a.port}/training   (Ctrl-C to stop)")
-    db.run_training(
-        train_tt.run,
-        dataset, output, cfg.train, backend,
-        dashboard=pc.training, masks_dir=pc.masks_dir,
-    )
+    # Route the dashboard's train stage to our TT host-reference loop (train_tt.run is a
+    # drop-in for ttgs.stages.train.run) so UI-driven (re)starts use it too — not gsplat.
+    pc = PipelineController(output_dir=output, cfg=cfg, backend=backend, frames_dir=frames,
+                            train_fn=train_tt.run, train_dataset_dir=dataset)
+    pc._set("extract", "done")        # the dataset already has frames + a COLMAP model;
+    pc._set("sfm", "done")            # the pipeline starts at the train stage.
+
+    db = DashboardServer(pc, port=a.port, host=a.host)
+    print(f"dashboard: {db._banner_url()}/training   (bound {a.host}:{a.port}, Ctrl-C to stop)")
+
+    pc.run_from("train")              # auto-start the first run in the background
+    db.run()                          # persistent server — stays up after a run finishes,
+                                      # so you can restart / extend iterations from the UI
 
 
 if __name__ == "__main__":

@@ -50,12 +50,16 @@ class PipelineController:
         cfg=None,           # ttgs.config.Config
         backend=None,       # ttgs.backend.detect.BackendInfo
         colmap_bin: str | None = None,
+        train_fn=None,            # override for the train stage (e.g. tt-splat's train_tt.run)
+        train_dataset_dir=None,   # explicit dataset dir for training (else derived from sfm_dir)
     ) -> None:
         self.output_dir  = output_dir
         self.source      = source
         self.cfg         = cfg
         self.backend     = backend
         self.colmap_bin  = colmap_bin
+        self._train_fn          = train_fn
+        self._train_dataset_dir = Path(train_dataset_dir) if train_dataset_dir else None
 
         # Derived directories
         self.frames_dir  = frames_dir or (output_dir / "frames")
@@ -548,7 +552,12 @@ class PipelineController:
                 masks_dir=masks_arg)
 
     def _stage_train(self) -> None:
-        from ttgs.stages.train import run as train_run
+        # Injected train fn (e.g. tt-splat's train_tt.run) takes precedence over the
+        # default gsplat stage. train_tt.run is a documented drop-in (same signature).
+        if self._train_fn is not None:
+            train_run = self._train_fn
+        else:
+            from ttgs.stages.train import run as train_run
 
         # Resolve backend lazily
         if self.backend is None:
@@ -560,9 +569,12 @@ class PipelineController:
         self.training = TrainingController(output_dir=self.output_dir,
                                            snapshot_every=snapshot_every)
 
-        dataset_dir = self.sfm_dir / "undistorted"
-        if not dataset_dir.exists():
-            dataset_dir = self.sfm_dir
+        if self._train_dataset_dir is not None:
+            dataset_dir = self._train_dataset_dir
+        else:
+            dataset_dir = self.sfm_dir / "undistorted"
+            if not dataset_dir.exists():
+                dataset_dir = self.sfm_dir
 
         train_run(
             dataset_dir,

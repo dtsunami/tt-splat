@@ -26,6 +26,51 @@ from ttgs.viewer.dashboard import build_update
 
 HOST_MAX_POINTS = int(os.environ.get("TT_MAX_POINTS", "1200"))   # host-render budget
 HOST_SIZE = int(os.environ.get("TT_SIZE", "96"))
+USE_DEVICE_RENDER = int(os.environ.get("TT_DEVICE_RENDER", "0"))  # render dashboard frame ON the Blackhole (M14)
+USE_DEVICE_TRAIN = int(os.environ.get("TT_DEVICE_TRAIN", "0"))    # fwd+bwd GRADIENTS on the Blackhole (Phase 2a)
+_render_device = None                                             # lazy: imports ttnn only when enabled
+_render_train = None
+
+if USE_DEVICE_TRAIN:                                              # correctness path is O(N) ttnn-ops → small scale
+    HOST_MAX_POINTS = min(HOST_MAX_POINTS or 16, 16)
+    HOST_SIZE = min(HOST_SIZE, 64)
+    print(f"device TRAIN enabled — capping to {HOST_MAX_POINTS} Gaussians @ {HOST_SIZE}px "
+          "(correctness path; perf kernel = Phase 2b)")
+
+
+def _train_render(P, cam, H, W, PX, PY):
+    """Training render feeding the loss. ON-DEVICE differentiable fwd+bwd (M16 bridge) when
+    TT_DEVICE_TRAIN=1, else host autograd. Falls back to host (loudly) on device error."""
+    global _render_train, USE_DEVICE_TRAIN
+    if USE_DEVICE_TRAIN:
+        try:
+            if _render_train is None:
+                from device_raster import render_train as _rt
+                _render_train = _rt
+                print("device TRAIN: ON — fwd+bwd gradients on the Blackhole (correctness path)")
+            return _render_train(P, cam, H, W)        # [H,W,3] float32, differentiable wrt P
+        except Exception as exc:
+            print(f"device train failed ({type(exc).__name__}: {exc}) — falling back to host autograd")
+            USE_DEVICE_TRAIN = 0
+    return render(P, cam, H, W, PX, PY)               # host float64, differentiable
+
+
+def _display_render(P, cam, H, W, PX, PY):
+    """Dashboard display frame. Renders ON-DEVICE (M14 rasterizer) when TT_DEVICE_RENDER=1, else host.
+    Falls back to host on any device error so the dashboard never breaks. Training math is unaffected
+    either way (this is the no-grad display path; gradients still use the host render)."""
+    global _render_device, USE_DEVICE_RENDER
+    if USE_DEVICE_RENDER:
+        try:
+            if _render_device is None:
+                from render_device import render_device as _rd   # server/ already on sys.path
+                _render_device = _rd
+                print("device render: ON — dashboard frames rendered on the Blackhole (M14)")
+            return _render_device(P, cam, H, W)
+        except Exception as exc:
+            print(f"device render failed ({type(exc).__name__}: {exc}) — falling back to host render")
+            USE_DEVICE_RENDER = 0
+    return render(P, cam, H, W, PX, PY).clamp(0, 1).float().cpu().numpy()
 
 
 def _load_colmap(dataset_dir: Path):
@@ -143,8 +188,8 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
         if focus is not None:
             cand = [i for i, v in enumerate(views) if v[6] == focus]; vi = cand[0] if cand else vi
         cam, gt, pm = views[vi], targets[vi], masks[vi]
-        img = render(P, cam, H, W, PX, PY)
-        diff = (img - gt)**2
+        img = _train_render(P, cam, H, W, PX, PY)              # host autograd OR device fwd+bwd
+        diff = (img - gt)**2                                   # torch promotes f32(device)/f64(gt) → f64
         if pm is not None: diff = diff * pm[..., None]          # per-image mask (frames.json)
         gmask = dashboard.get_mask() if dashboard is not None else None
         if gmask is not None:                                   # global mask (dashboard painter)
@@ -155,7 +200,9 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
 
         if dashboard is not None and (step == 1 or step % max(1, getattr(cfg, "dashboard_every", 25)) == 0):
             with torch.no_grad():
-                r = render(P, cam, H, W, PX, PY).clamp(0, 1).float().cpu().numpy()
+                # device-train already rendered on-device this step — reuse it (no second render)
+                r = (img.detach().clamp(0, 1).float().cpu().numpy() if USE_DEVICE_TRAIN
+                     else _display_render(P, cam, H, W, PX, PY))
                 g = gt.clamp(0, 1).float().cpu().numpy()
                 l = float(loss.detach())
             dashboard.push_update(build_update(

@@ -342,7 +342,13 @@ def blackhole(
     output: Path = typer.Option(Path("work/tt_out"), "--output", "-o",
                                 help="Output directory", metavar="DIR"),
     port: int = typer.Option(7860, "--port", "-p", help="Dashboard server port"),
-    steps: int = typer.Option(2000, "--steps", help="Training iterations"),
+    host: str = typer.Option("0.0.0.0", "--host",
+                             help="Interface to bind (default 0.0.0.0 = all IPs; 127.0.0.1 = local-only)"),
+    steps: int = typer.Option(30000, "--steps", help="Training iterations"),
+    device_render: bool = typer.Option(False, "--device-render", "-D",
+                                       help="Render the dashboard frame ON the Blackhole (M14 device rasterizer)"),
+    device_train: bool = typer.Option(False, "--device-train",
+                                      help="Run training fwd+bwd GRADIENTS on the Blackhole (Phase 2a, small scale)"),
 ) -> None:
     """[bold]Train on Tenstorrent Blackhole[/] — the ttgs dashboard driving the TT pipeline.
 
@@ -353,11 +359,11 @@ def blackhole(
     Examples:
 
       ttgs blackhole work/scene
-      ttgs blackhole work/scene --output work/tt_out --port 7860 --steps 2000
+      ttgs blackhole work/scene --output work/tt_out --port 7860 --steps 30000
 
     Then open [bold]http://localhost:7860/training[/]
     """
-    import subprocess
+    import os, subprocess
     repo = Path(__file__).resolve().parent.parent
     script = repo / "server" / "serve_blackhole.py"
     if not script.exists():
@@ -368,9 +374,15 @@ def blackhole(
         console.print(f"[bold red]error:[/] dataset not found: {dataset}")
         raise typer.Exit(1)
     cmd = [sys.executable, str(script), "--dataset", str(dataset),
-           "--output", str(output), "--port", str(port), "--steps", str(steps)]
-    console.print(f"[dim]→ {' '.join(cmd)}[/]")
-    raise typer.Exit(subprocess.call(cmd))
+           "--output", str(output), "--port", str(port), "--host", host, "--steps", str(steps)]
+    env = os.environ.copy()
+    if device_render:
+        env["TT_DEVICE_RENDER"] = "1"        # train_tt renders the dashboard frame on-device
+    if device_train:
+        env["TT_DEVICE_TRAIN"] = "1"         # train_tt runs fwd+bwd gradients on-device (small scale)
+    tag = "  (device train)" if device_train else ("  (device render)" if device_render else "")
+    console.print(f"[dim]→ {' '.join(cmd)}{tag}[/]")
+    raise typer.Exit(subprocess.call(cmd, env=env))
 
 
 # ─── info ────────────────────────────────────────────────────────────────────
