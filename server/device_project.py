@@ -18,9 +18,10 @@ def _dt(dev, t):
     return ttnn.from_torch(t.float().reshape(-1), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
 
 
-def project_geom(dev, mean, scale, quat, cam):
+def project_geom(dev, mean, scale, quat, cam, aux=False):
     """mean,scale [N,3], quat [N,4] (host torch or already device-resident host slices). Returns ttnn
-    [N] tensors: u, v, zc, (a, b, c) conic — matching project_general's geometry outputs."""
+    [N] tensors: u, v, zc, (a, b, c) conic — matching project_general's geometry outputs.
+    If aux=True also returns a dict of ttnn intermediates the analytic backward (Stage D) consumes."""
     Rv, tv, fx, fy, cx, cy = cam[:6]
     R = [[float(Rv[i][j]) for j in range(3)] for i in range(3)]
     tvs = [float(tv[i]) for i in range(3)]
@@ -101,7 +102,15 @@ def project_geom(dev, mean, scale, quat, cam):
     det = ttnn.add(ttnn.sub(ttnn.mul(a_, c_), ttnn.square(b_)), 1e-9)
     di = ttnn.reciprocal(det)
     ca = ttnn.mul(c_, di); cb = ttnn.mul(ttnn.mul(b_, di), -1.0); cc = ttnn.mul(a_, di)
-    return u, v, mc2, (ca, cb, cc)
+    if not aux:
+        return u, v, mc2, (ca, cb, cc)
+    A = dict(zi=zi, zi2=zi2, mc0=mc0, mc1=mc1, mc2=mc2, z=z,
+             J00=J00, J02=J02, J11=J11, J12=J12,
+             SC00=SC00, SC01=SC01, SC02=SC02, SC11=SC11, SC12=SC12, SC22=SC22,
+             a_=a_, b_=b_, c_=c_, di=di,
+             Rij=Rij, s2=s2, qn=(qw, qx, qy, qz), qnorm=nrm,
+             R=R, tvs=tvs, fx=fx, fy=fy, N=mean.shape[0])
+    return u, v, mc2, (ca, cb, cc), A
 
 
 _C0 = 0.28209479177387814
@@ -111,8 +120,9 @@ _C3 = [-0.5900435899266435, 2.890611442640554, -0.4570457994644658, 0.3731763325
        -0.4570457994644658, 1.445305721320277, -0.5900435899266435]
 
 
-def project_color(dev, mean, sh, deg, cam):
-    """Device sh_eval: returns (colR,colG,colB) ttnn [N] in [0,1]. Mirrors train_real.sh_eval."""
+def project_color(dev, mean, sh, deg, cam, aux=False):
+    """Device sh_eval: returns (colR,colG,colB) ttnn [N] in [0,1]. Mirrors train_real.sh_eval.
+    If aux=True also returns a dict with dirs (x,y,z), |d|-recip, basis wb and pre-clamp values."""
     Rv, tv = cam[0], cam[1]
     cc = (-Rv.double().T @ tv.double()).tolist()                 # camera center (world)
     mx, my, mz = _dt(dev, mean[:, 0]), _dt(dev, mean[:, 1]), _dt(dev, mean[:, 2])
@@ -138,13 +148,17 @@ def project_color(dev, mean, sh, deg, cam):
                        ttnn.mul(ttnn.mul(x, ttnn.sub(ttnn.sub(ttnn.mul(zz, 4.0), xx), yy)), _C3[4]),
                        ttnn.mul(ttnn.mul(z, ttnn.sub(xx, yy)), _C3[5]),
                        ttnn.mul(ttnn.mul(x, ttnn.sub(xx, ttnn.mul(yy, 3.0))), _C3[6])]
-    out = []
+    out, pre = [], []
     for c in range(3):
         r = ttnn.add(ttnn.mul(sh_c(0, c), _C0), 0.5)             # DC + 0.5
         for k in range(1, len(wb)):
             r = ttnn.add(r, ttnn.mul(wb[k], sh_c(k, c)))
+        pre.append(r)
         out.append(ttnn.clamp(r, 0.0, 1.0))
-    return out[0], out[1], out[2]
+    if not aux:
+        return out[0], out[1], out[2]
+    A = dict(x=x, y=y, z=z, inv=inv, wb=wb, pre=pre, cc_world=cc)
+    return out[0], out[1], out[2], A
 
 
 def project_op(dev, op_logit):
