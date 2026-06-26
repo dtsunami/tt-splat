@@ -18,6 +18,29 @@ def _dt(dev, t):
     return ttnn.from_torch(t.float().reshape(-1), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
 
 
+def _is_tt(t):
+    return isinstance(t, ttnn.Tensor)
+
+
+def _col(dev, t, c):
+    """Column c of a param as a [N] ttnn tensor. Accepts host torch [N]/[N,C] OR device-resident ttnn
+    [N]/[N,C] (sliced ON DEVICE — no host readback, the Stage E device-resident path)."""
+    if _is_tt(t):
+        if len(t.shape) == 1:
+            return t
+        N = t.shape[0]
+        return ttnn.reshape(ttnn.slice(t, [0, c], [N, c + 1]), (N,))
+    return _dt(dev, t[:, c] if t.dim() > 1 else t)
+
+
+def _shcol(dev, sh, k, c):
+    """sh[:,k,c] as [N] ttnn. Host torch [N,K,3] or device-resident ttnn [N,K,3] (on-device slice)."""
+    if _is_tt(sh):
+        N = sh.shape[0]
+        return ttnn.reshape(ttnn.slice(sh, [0, k, c], [N, k + 1, c + 1]), (N,))
+    return _dt(dev, sh[:, k, c])
+
+
 def project_geom(dev, mean, scale, quat, cam, aux=False):
     """mean,scale [N,3], quat [N,4] (host torch or already device-resident host slices). Returns ttnn
     [N] tensors: u, v, zc, (a, b, c) conic — matching project_general's geometry outputs.
@@ -27,9 +50,9 @@ def project_geom(dev, mean, scale, quat, cam, aux=False):
     tvs = [float(tv[i]) for i in range(3)]
     fx, fy, cx, cy = float(fx), float(fy), float(cx), float(cy)
 
-    mx, my, mz = _dt(dev, mean[:, 0]), _dt(dev, mean[:, 1]), _dt(dev, mean[:, 2])
+    mx, my, mz = _col(dev, mean, 0), _col(dev, mean, 1), _col(dev, mean, 2)
     # normalize quat on device
-    qw, qx, qy, qz = (_dt(dev, quat[:, i]) for i in range(4))
+    qw, qx, qy, qz = (_col(dev, quat, i) for i in range(4))
     nrm = ttnn.sqrt(ttnn.add(ttnn.add(ttnn.square(qw), ttnn.square(qx)),
                              ttnn.add(ttnn.square(qy), ttnn.square(qz))))
     inrm = ttnn.reciprocal(nrm)
@@ -51,7 +74,7 @@ def project_geom(dev, mean, scale, quat, cam, aux=False):
     Rij[1, 2] = ttnn.mul(ttnn.sub(m2(qy, qz), m2(qw, qx)), two)
     Rij[2, 1] = ttnn.mul(ttnn.add(m2(qy, qz), m2(qw, qx)), two)
 
-    s2 = [ttnn.exp(ttnn.mul(_dt(dev, scale[:, k]), two)) for k in range(3)]   # exp(scale)^2 = exp(2 scale)
+    s2 = [ttnn.exp(ttnn.mul(_col(dev, scale, k), two)) for k in range(3)]   # exp(scale)^2 = exp(2 scale)
 
     # Sig3 = R diag(S2) R^T  (symmetric); Sig3[i][j] = sum_k R[i][k]*S2[k]*R[j][k]
     def sig3(i, j):
@@ -125,12 +148,12 @@ def project_color(dev, mean, sh, deg, cam, aux=False):
     If aux=True also returns a dict with dirs (x,y,z), |d|-recip, basis wb and pre-clamp values."""
     Rv, tv = cam[0], cam[1]
     cc = (-Rv.double().T @ tv.double()).tolist()                 # camera center (world)
-    mx, my, mz = _dt(dev, mean[:, 0]), _dt(dev, mean[:, 1]), _dt(dev, mean[:, 2])
+    mx, my, mz = _col(dev, mean, 0), _col(dev, mean, 1), _col(dev, mean, 2)
     dx = ttnn.sub(mx, cc[0]); dy = ttnn.sub(my, cc[1]); dz = ttnn.sub(mz, cc[2])
     inv = ttnn.reciprocal(ttnn.add(ttnn.sqrt(ttnn.add(ttnn.add(ttnn.square(dx), ttnn.square(dy)),
                                                       ttnn.square(dz))), 1e-9))
     x, y, z = ttnn.mul(dx, inv), ttnn.mul(dy, inv), ttnn.mul(dz, inv)
-    sh_c = lambda k, c: _dt(dev, sh[:, k, c])
+    sh_c = lambda k, c: _shcol(dev, sh, k, c)
     wb = [None]                                                  # wb[k] = C-weighted spatial basis (k>=1)
     if deg >= 1:
         wb += [ttnn.mul(y, -_C1), ttnn.mul(z, _C1), ttnn.mul(x, -_C1)]
@@ -162,4 +185,4 @@ def project_color(dev, mean, sh, deg, cam, aux=False):
 
 
 def project_op(dev, op_logit):
-    return ttnn.sigmoid(_dt(dev, op_logit))
+    return ttnn.sigmoid(op_logit if _is_tt(op_logit) else _dt(dev, op_logit))

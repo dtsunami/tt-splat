@@ -12,10 +12,12 @@ Golden = torch autograd of train_real.project_general/sh_eval.  Device target (f
 from __future__ import annotations
 import torch
 import ttnn
-from device_project import project_geom, project_color, _dt, _C0, _C1, _C2, _C3
+from device_project import project_geom, project_color, project_op, _dt, _shcol, _C0, _C1, _C2, _C3
 
 
-def _t2t(dev, t):                       # torch [N] -> ttnn [N]
+def _t2t(dev, t):                       # torch/numpy [N] -> ttnn [N]
+    if not torch.is_tensor(t):
+        t = torch.as_tensor(t)
     return ttnn.from_torch(t.float().reshape(-1), dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=dev)
 
 
@@ -65,19 +67,24 @@ def _basis_deriv(x, y, z, deg):
     return out
 
 
-def project_backward(dev, P, cam, up):
-    """P: dict with mean,scale,quat,op,sh (host torch), deg.  cam: (Rv,tv,fx,fy,cx,cy).
-    up: dict of upstream grads u,v,ca,cb,cc,op,colR,colG,colB (host torch [N]).
+def project_backward(dev, P, cam, up, aux=None):
+    """P: dict with mean,scale,quat,op,sh (host torch OR device-resident ttnn), deg.
+    cam: (Rv,tv,fx,fy,cx,cy).  up: dict of upstream grads u,v,ca,cb,cc,op,colR,colG,colB (host torch [N]).
+    aux: optional (A_geom, A_color) from the Stage B forward (aux=True) — pass to SKIP the forward
+    recompute (the Stage E device-resident path; the forward already produced them).
     Returns gP dict of host torch grads: mean[N,3], scale[N,3], quat[N,4], op[N], sh[N,K,3]."""
     mean, scale, quat, sh, deg = P["mean"], P["scale"], P["quat"], P["sh"], P["deg"]
     N = mean.shape[0]; K = sh.shape[1]
     Rv = cam[0]
-    _, _, _, _, A = project_geom(dev, mean, scale, quat, cam, aux=True)
-    _, _, _, AC = project_color(dev, mean, sh, deg, cam, aux=True)
-    U = {k: _t2t(dev, up[k]) for k in up}
+    if aux is None:
+        _, _, _, _, A = project_geom(dev, mean, scale, quat, cam, aux=True)
+        _, _, _, AC = project_color(dev, mean, sh, deg, cam, aux=True)
+    else:
+        A, AC = aux
+    U = {k: (up[k] if isinstance(up[k], ttnn.Tensor) else _t2t(dev, up[k])) for k in up}
 
     # ===== (1) opacity =====
-    op = ttnn.sigmoid(_dt(dev, P["op"]))
+    op = project_op(dev, P["op"])
     gop = m(m(U["op"], op), ad(neg(op), 1.0))
 
     # ===== (2) SH color: gpre_c = up_col_c * cmask_c =====
@@ -99,7 +106,7 @@ def project_backward(dev, P, cam, up):
     for c in range(3):
         sc = [ttnn.add(Z, 0.0) for _ in range(3)]            # sum_k sh[k,c]*dB[k,d]
         for k in range(1, K):
-            shkc = _dt(dev, sh[:, k, c])
+            shkc = _shcol(dev, sh, k, c)
             for dmn in range(3):
                 sc[dmn] = ad(sc[dmn], m(shkc, db[k][dmn]))
         for dmn in range(3):
