@@ -24,8 +24,10 @@ void kernel_main() {
 """
 COMPUTE = r"""
 #include "api/compute/common.h"
+#include "api/compute/compute_kernel_hw_startup.h"
 #include "api/compute/reduce.h"
 void kernel_main() {
+    compute_kernel_hw_startup(0, 1, 16);   // FIX: unpacker/packer HW init (icb0=data, icb1=scaler, ocb=out)
     cb_wait_front(0,1); cb_wait_front(1,1);
     cb_reserve_back(16,1);
     reduce_init<PoolType::SUM, ReduceDim::REDUCE_SCALAR>(0, 1, 16);

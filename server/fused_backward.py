@@ -36,6 +36,75 @@ READER, COMPUTE, WRITER = _g["READER"], _g["COMPUTE"], _g["WRITER"]
 
 _NAMES = ["col", "op", "a", "c", "b", "cx", "cy"]   # CB pack order 16..22
 
+# ============================================================================================
+# STAGE 2 — on-device per-tile reduce via a SEPARATE fp32 reduce dispatch (gate FB_S2=1). A fused
+# single-kernel reduce was tried but can't reach the precision needed (a/c grads are signed dx^2/dy^2
+# sums; bf16 dst -> rel 1.0), and enforce_fp32_accumulation
+# requires global fp32_dest_acc_en, which halves dst 16->8 and breaks m17's 16-slot arithmetic. So:
+#   dispatch-1 = m17 (writes 7 full-tile products to L1, unchanged)
+#   dispatch-2 = these RED kernels (fp32_dest_acc_en=True): stream each L1 product tile -> fp32 reduce ->
+#                scalar -> ONE packed output tile/core at [g,j]. Products never round-trip host.
+# ============================================================================================
+READER_RED = r"""
+#include "dataflow_api.h"
+void kernel_main() {
+    uint32_t sx=get_arg_val<uint32_t>(0), sy=get_arg_val<uint32_t>(1), nb=get_arg_val<uint32_t>(2), K=get_arg_val<uint32_t>(3);
+    cb_reserve_back(23,1);
+    volatile tt_l1_ptr uint32_t* sp=(volatile tt_l1_ptr uint32_t*)get_write_ptr(23);
+    for (uint32_t k=0;k<1024;k++) sp[k]=0;
+    for (uint32_t f=0;f<4;f++) for (uint32_t k=0;k<16;k++) sp[f*256+k]=0x3F800000u;
+    cb_push_back(23,1);
+    for (uint32_t g=0; g<K; g++)
+        for (uint32_t j=0; j<7; j++) {
+            uint32_t base=get_arg_val<uint32_t>(4+j);           // out_j per-core shard base
+            cb_reserve_back(0,1);
+            noc_async_read(get_noc_addr(sx,sy, base + g*nb), get_write_ptr(0), nb);
+            noc_async_read_barrier();
+            cb_push_back(0,1);
+        }
+}
+"""
+
+COMPUTE_RED = r"""
+#include "api/compute/common.h"
+#include "api/compute/compute_kernel_hw_startup.h"
+#include "api/compute/reduce.h"
+void kernel_main() {
+    constexpr uint32_t K = get_compile_time_arg_val(0);
+    cb_wait_front(23,1);
+    compute_kernel_hw_startup(0, 23, 16);
+    reduce_init<PoolType::SUM, ReduceDim::REDUCE_SCALAR, true>(0, 23, 16);
+    for (uint32_t i=0; i<7*K; i++) {
+        cb_wait_front(0,1); cb_reserve_back(16,1);
+        tile_regs_acquire();
+        reduce_tile<PoolType::SUM, ReduceDim::REDUCE_SCALAR, true>(0, 23, 0, 0, 0);
+        tile_regs_commit(); tile_regs_wait();
+        pack_tile(0,16);
+        tile_regs_release();
+        cb_push_back(16,1); cb_pop_front(0,1);
+    }
+    reduce_uninit<true>();
+}
+"""
+
+WRITER_RED = r"""
+#include "dataflow_api.h"
+void kernel_main() {
+    uint32_t sx=get_arg_val<uint32_t>(0), sy=get_arg_val<uint32_t>(1), nb=get_arg_val<uint32_t>(2), K=get_arg_val<uint32_t>(3);
+    uint32_t base=get_arg_val<uint32_t>(4);   // packed output tile/core: scalar -> logical [g, j*4] (16B-aligned)
+    for (uint32_t g=0; g<K; g++)              // 4-byte noc writes MUST be 16B-aligned (col stride 4 floats)
+        for (uint32_t j=0; j<7; j++) {
+            uint32_t col = j*4;                                   // logical column (0,4,8,...,24)
+            uint32_t face = (col < 16) ? 0u : 1u;                 // tile face0=cols0-15, face1=cols16-31
+            uint32_t off  = (face*256u + g*16u + (col - face*16u)) * 4u;   // byte offset in tile storage
+            cb_wait_front(16,1);
+            noc_async_write(get_read_ptr(16), get_noc_addr(sx,sy, base + off), 4);
+            noc_async_write_barrier();
+            cb_pop_front(16,1);
+        }
+}
+"""
+
 
 def _block(dev, grid, totH, totW, shard_h, data=None):
     sh = ttnn.ShardSpec(grid, [shard_h, TS], ttnn.ShardOrientation.ROW_MAJOR)
@@ -80,6 +149,7 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
 
     import os as _os, time as _time
     _PROF = _os.environ.get("FB_PROF", "0") == "1"
+    _S2 = _os.environ.get("FB_S2", "0") == "1"     # Stage 2: fused in-kernel reduce + compact readback
     _tac = {"alloc": 0.0, "args": 0.0, "prog": 0.0, "disp": 0.0, "readback": 0.0, "accum": 0.0}
     def _now(): return _time.perf_counter()
     # ---- STAGE 1: precompute channel-INVARIANT geometry args ONCE; patch only `col` per channel ----
@@ -100,8 +170,10 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
                                   f2u(opv[i]), 0, f2u(bv[i])]    # col (idx 6) patched per channel below
                         real.append((si, i))
                 geo_args[(c, gx, gy)] = (cargs, real)
-    outs = [_block(dev, grid, GY * SHF, Wp, SHF) for _ in range(7)]   # hoisted: drained each chunk -> reusable
+    outs = [_block(dev, grid, GY * SHF, Wp, SHF) for _ in range(7)]   # dispatch-1 (m17) products in L1
     out_addrs = [o.buffer_address() for o in outs]
+    if _S2:                                          # dispatch-2 compact output: ONE tile/core, scalar at [g,j]
+        out_s2 = _block(dev, grid, GY * TS, GX * TS, TS)
     _tac["args"] += _now() - _t
 
     for k in range(3):
@@ -127,16 +199,43 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
                     rt_c[gx][gy] = cc
                     rt_w[gx][gy] = [sx, sy, FUSED_K, NB] + out_addrs
             _tac["args"] += _now() - _t; _t = _now()
-            prog = ttnn.ProgramDescriptor(kernels=[
+            prog = ttnn.ProgramDescriptor(kernels=[       # dispatch-1: m17 -> 7 full-tile products in L1
                 ks(READER, rt_r, ttnn.ReaderConfigDescriptor()),
                 ks(COMPUTE, rt_c, ttnn.ComputeConfigDescriptor(), [FUSED_K]),
                 ks(WRITER, rt_w, ttnn.WriterConfigDescriptor())],
                 semaphores=[], cbs=[cbf(i, 2) for i in (0, 1, 2, 24, 25, 26, 27)] + [cbf(i, 3) for i in range(16, 23)])
             _tac["prog"] += _now() - _t; _t = _now()
             ttnn.generic_op([PXt, outs[0]], prog)
+            if _S2:                                       # dispatch-2: fp32 reduce each L1 product tile -> scalar
+                rr, rc, rw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+                for gx in range(GX):
+                    for gy in range(GY):
+                        sx, sy = coords[(gx, gy)]
+                        rr[gx][gy] = [sx, sy, NB, FUSED_K] + out_addrs
+                        rc[gx][gy] = []
+                        rw[gx][gy] = [sx, sy, NB, FUSED_K, out_s2.buffer_address()]
+                cfg32 = ttnn.ComputeConfigDescriptor(); cfg32.fp32_dest_acc_en = True
+                prog2 = ttnn.ProgramDescriptor(kernels=[
+                    ks(READER_RED, rr, ttnn.ReaderConfigDescriptor()),
+                    ks(COMPUTE_RED, rc, cfg32, [FUSED_K]),
+                    ks(WRITER_RED, rw, ttnn.WriterConfigDescriptor())],
+                    semaphores=[], cbs=[cbf(0, 4), cbf(16, 4), cbf(23, 1)])
+                ttnn.generic_op([outs[0], out_s2], prog2)
+                if _os.environ.get("FB_DBG", "0") == "1" and k == 0 and c == 0:
+                    dbg = ttnn.to_torch(out_s2).reshape(GY, TS, GX, TS)
+                    for j, o in enumerate(outs):
+                        ref_full = ttnn.to_torch(o).reshape(GY, FUSED_K, TS, GX, TS).sum(dim=(2, 4))
+                        dev_red = dbg[:, :FUSED_K, :, j * 4]
+                        e = (dev_red - ref_full).abs().max().item(); s = ref_full.abs().max().item() + 1e-9
+                        print(f"   DBG out[{j}]={_NAMES[j]:3}: dev-reduce vs host-sum-of-same-products "
+                              f"max_abs={e:.3e} rel={e/s:.3e}", flush=True)
             _tac["disp"] += _now() - _t; _t = _now()
-            # reduce each [GY*FK*TS, GX*TS] output to per-(tile-row, slot, tile-col) scalars in ONE torch op
-            hs = [ttnn.to_torch(o).reshape(GY, FUSED_K, TS, GX, TS).sum(dim=(2, 4)).numpy() for o in outs]
+            if _S2:    # ONE small readback; fp32-reduced scalar lives at logical [g, j*4] (16B-aligned writes)
+                tt = ttnn.to_torch(out_s2).reshape(GY, TS, GX, TS)
+                hs = [tt[:, :FUSED_K, :, j * 4].numpy() for j in range(7)]
+            else:
+                # reduce each [GY*FK*TS, GX*TS] output to per-(tile-row, slot, tile-col) scalars in ONE torch op
+                hs = [ttnn.to_torch(o).reshape(GY, FUSED_K, TS, GX, TS).sum(dim=(2, 4)).numpy() for o in outs]
             _tac["readback"] += _now() - _t; _t = _now()
             for gx in range(GX):                          # 9 tiles, vectorized over slots (no per-element float())
                 for gy in range(GY):
