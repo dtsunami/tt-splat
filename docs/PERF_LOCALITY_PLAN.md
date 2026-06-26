@@ -20,6 +20,18 @@ Decisive de-prioritizations from the verdicts: drop the partial per-row reduce (
 - Only the deferred bin/sort crosses host — and ONLY until it can move on-die. Everything else (projection, raster, accumulate, Adam) stays resident; the forward 2D readback exists solely to feed the host lexsort and is the last host hop to remove.
 - Encode args once per immutable thing, stream the variable slice: per-Gaussian scalars are step-invariant except col (per-channel); pack once, don't rebuild RuntimeArgs per (chunk,channel,core).
 
+## Exploration results — RESOLVED on silicon (2026-06-26)
+
+All 5 probes ran on the Blackhole (`scratchpad/probe_E{1..5}_*.py`). Outcomes:
+
+- **E1 — readback latency vs bandwidth: MIXED, bulk dominates.** ~13µs/call fixed floor + ~5 GB/s bulk; the real 576KB Stage-A output block = **116µs/call**. At nbatch=63 → bulk ≈136ms ≫ call-floor ≈17ms, plus ~106ms host `.sum()`. → **Stage 2 (reduce bytes + kill host sum) is the bigger lever**; Stage 3 (drain-once) mops up the call floor. Ordering confirmed.
+- **E2 — on-device reduce precision: PASS, but mechanism corrected.** In-kernel `reduce_tile<SUM,REDUCE_SCALAR>` is **broken/abandoned in this build** (base `smoke_reduce.py` also returns 0). `ttnn.sum` holds the gate easily: **worst rel_err 2.0e-3** across signed/large/near-cancel, 0.011ms/call. → **Stage 2 reduces via `ttnn.sum`, NOT `reduce_tile`** (false dependency removed).
+- **E3 — owner-single-writer FP32 reduce: PASS, primitive proven.** Bit-exact at **all-to-all 8 owners × up to 48 sources, no wedge**, FP32 drain **~63 cyc/elem**. → Stage 5 primitive validated on silicon. Cross-findings: a RISC-loop is **too slow for the 1024-pixel reduce** (63 cyc × 1024 × K × 7 ≈ 72ms/core → reinforces "Stage 2 = `ttnn.sum`"), but **fine for the owner-reduce** (fan-in ~15). The **router-gap is real** (grid 11×10, x=12 invalid) → `home(g)` must map through a physical core lookup table (Stage 6 risk confirmed).
+- **E4 — inbox sizing: L1 fits the near-term regime.** Realistic scenes (`spread-small` rep≈2.7, `clustered` rep≈3.9) → L1-resident inboxes **fit to ~256k–512k Gaussians** (worst ≈166–238KB at 256k); spill toward 1M and for `large-gaussians` (rep≈15). Full-batch inbox is the upper bound — **incremental per-wave drain shrinks it**; GDDR tiering (Stage 7b) is the scale trigger past the crossover, not a near-term blocker.
+- **E5 — persistent-kernel L1 param streaming: PASS.** A `generic_op` kernel reads per-Gaussian params from an **L1 scratch buffer** (not `get_arg_val`) and loops **M=1024** (far past the ~42-Gaussian runtime-arg cap), **compile-once** (count via one runtime arg), bit-exact. → Stages 3/5/6 substrate is buildable. Caveat: naive scalar volatile-L1 reads ~1500 cyc/Gaussian → feed via CB/reader and overlap on the DM RISC.
+
+**Net:** every big bet de-risked. Two plan refinements: (1) **Stage 2 mechanism = `ttnn.sum`** (reduce_tile is dead); (2) `home(g)` needs a **runtime physical-core lookup table** (router gaps). Stage 5's primitive and the persistent substrate are proven on silicon; L1 residency is sound to ~256–512k Gaussians.
+
 ## Exploration track — RUN FIRST (de-risk the XL bets before building)
 
 ### E1. Split the 260ms readback into per-call latency vs per-byte transfer/untilize
