@@ -82,32 +82,50 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
     _PROF = _os.environ.get("FB_PROF", "0") == "1"
     _tac = {"alloc": 0.0, "args": 0.0, "prog": 0.0, "disp": 0.0, "readback": 0.0, "accum": 0.0}
     def _now(): return _time.perf_counter()
+    # ---- STAGE 1: precompute channel-INVARIANT geometry args ONCE; patch only `col` per channel ----
+    _t = _now()
+    _DC = [f2u(_DUMMY_G["cx"]), f2u(_DUMMY_G["cy"]), f2u(_DUMMY_G["a"]), f2u(2 * _DUMMY_G["b"]),
+           f2u(_DUMMY_G["c"]), f2u(_DUMMY_G["op"]), f2u(_DUMMY_G["col"]), f2u(_DUMMY_G["b"])]   # cached dummy block
+    geo_args = {}                                       # (c,gx,gy) -> (cargs[8*FUSED_K], real [(slot,gid)])
+    for c in range(nbatch):
+        for gx in range(GX):
+            for gy in range(GY):
+                _, padded = tile_chunk(gy * ntx + gx, c)
+                cargs = []; real = []
+                for si, i in enumerate(padded):
+                    if i is None:
+                        cargs += _DC
+                    else:
+                        cargs += [f2u(cxv[i]), f2u(cyv[i]), f2u(av[i]), f2u(2 * bv[i]), f2u(cv[i]),
+                                  f2u(opv[i]), 0, f2u(bv[i])]    # col (idx 6) patched per channel below
+                        real.append((si, i))
+                geo_args[(c, gx, gy)] = (cargs, real)
+    outs = [_block(dev, grid, GY * SHF, Wp, SHF) for _ in range(7)]   # hoisted: drained each chunk -> reusable
+    out_addrs = [o.buffer_address() for o in outs]
+    _tac["args"] += _now() - _t
+
     for k in range(3):
         dLt = _block(dev, grid, Hp, Wp, TS, torch.from_numpy(gi[:, :, k].copy()))
         Tt = _block(dev, grid, Hp, Wp, TS, torch.from_numpy(Tfin.copy()))
         St = _block(dev, grid, Hp, Wp, TS, torch.zeros(Hp, Wp))
         for c in range(nbatch):
             _t = _now()
-            outs = [_block(dev, grid, GY * SHF, Wp, SHF) for _ in range(7)]
             Sout = _block(dev, grid, Hp, Wp, TS)
             Tout = _block(dev, grid, Hp, Wp, TS)
             _tac["alloc"] += _now() - _t; _t = _now()
             rt_r, rt_c, rt_w = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
             for gx in range(GX):
                 for gy in range(GY):
-                    sx, sy = coords[(gx, gy)]; t = gy * ntx + gx
-                    _, padded = tile_chunk(t, c)
+                    sx, sy = coords[(gx, gy)]
                     rt_r[gx][gy] = [sx, sy, PXt.buffer_address(), PYt.buffer_address(), dLt.buffer_address(),
                                     Tt.buffer_address(), St.buffer_address(), NB, FUSED_K,
                                     Sout.buffer_address(), Tout.buffer_address()]
-                    cargs = []
-                    for i in padded:
-                        q = (_DUMMY_G if i is None else
-                             {"cx": cxv[i], "cy": cyv[i], "a": av[i], "b": bv[i], "c": cv[i], "op": opv[i], "col": colv[k][i]})
-                        cargs += [f2u(q["cx"]), f2u(q["cy"]), f2u(q["a"]), f2u(2 * q["b"]), f2u(q["c"]),
-                                  f2u(q["op"]), f2u(q["col"]), f2u(q["b"])]
-                    rt_c[gx][gy] = cargs
-                    rt_w[gx][gy] = [sx, sy, FUSED_K, NB] + [o.buffer_address() for o in outs]
+                    cargs, real = geo_args[(c, gx, gy)]
+                    cc = cargs[:]                          # copy; patch only the per-channel col words
+                    for (si, i) in real:
+                        cc[si * 8 + 6] = f2u(colv[k][i])
+                    rt_c[gx][gy] = cc
+                    rt_w[gx][gy] = [sx, sy, FUSED_K, NB] + out_addrs
             _tac["args"] += _now() - _t; _t = _now()
             prog = ttnn.ProgramDescriptor(kernels=[
                 ks(READER, rt_r, ttnn.ReaderConfigDescriptor()),
