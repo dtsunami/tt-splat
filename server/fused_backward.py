@@ -116,7 +116,7 @@ def _block(dev, grid, totH, totW, shard_h, data=None):
                            device=dev, memory_config=mc)
 
 
-def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, nty, Wp, Hp, gi, Tfin):
+def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, nty, Wp, Hp, gi, Tfin, stage=None):
     """STAGE A — grid-sharded backward: ONE dispatch per (chunk, channel), all tiles parallel (vs the
     host-tile-loop). Block-shard PX/PY/dLdC/T/S per tile; each core runs the m17 kernel on its tile's
     chunk of <=FUSED_K Gaussians; S/T threaded across chunks as on-device block-sharded tensors. Products
@@ -150,8 +150,11 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
 
     import os as _os, time as _time
     _PROF = _os.environ.get("FB_PROF", "0") == "1"
-    _S3 = _os.environ.get("FB_S3", "0") == "1"     # Stage 3: on-device accumulate, drain ONCE per channel
-    _S2 = _os.environ.get("FB_S2", "0") == "1" and not _S3   # Stage 2: in-kernel reduce, per-chunk readback
+    if stage is None:                              # no explicit caller stage -> env (default = baseline host reduce)
+        _S3 = _os.environ.get("FB_S3", "0") == "1"     # Stage 3: on-device accumulate, drain ONCE per channel
+        _S2 = _os.environ.get("FB_S2", "0") == "1" and not _S3   # Stage 2: in-kernel reduce, per-chunk readback
+    else:                                          # explicit override ("s3"/"s2"/"base"); training defaults to "s3"
+        _S3 = stage == "s3"; _S2 = stage == "s2"
     _red = _S2 or _S3                              # both need the fp32 reduce dispatch
     _tac = {"alloc": 0.0, "args": 0.0, "prog": 0.0, "disp": 0.0, "readback": 0.0, "accum": 0.0}
     def _now(): return _time.perf_counter()

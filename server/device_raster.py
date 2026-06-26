@@ -14,7 +14,7 @@ Correctness-first: this is O(N) ttnn dispatches (slow → small scale only). The
 kernel (Phase 2b) swaps in behind this same DeviceRaster interface for real-scale max perf.
 """
 from __future__ import annotations
-import sys
+import sys, os
 from pathlib import Path
 import numpy as np
 import torch
@@ -141,7 +141,8 @@ class DeviceRaster(torch.autograd.Function):
                 g2 = np.zeros((Hp, Wp, 3), np.float64); g2[:gi.shape[0], :gi.shape[1], :] = gi; gi = g2
             cxv, cyv, av, bv, cv, opv, colv = ctx.cxv, ctx.cyv, ctx.av, ctx.bv, ctx.cv, ctx.opv, ctx.colv
             # STAGE A: grid-sharded backward — ONE dispatch per (chunk,channel), all tiles parallel
-            gv, cgv = fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tl, ntx, Hp // 32, Wp, Hp, gi, Tfin)
+            gv, cgv = fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tl, ntx, Hp // 32, Wp, Hp, gi, Tfin,
+                                          stage=os.environ.get("TT_FB_STAGE", "s3"))   # Stage 3 default
             for key in ("cx", "cy", "a", "b", "c", "op"):
                 geomg[key][vidx] = gv[key]                    # valid-subset -> original Gaussian index
             for k in range(3):

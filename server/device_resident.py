@@ -17,7 +17,7 @@ Correctness gate: convergence on real data + per-step 3D grads match the host-au
 Perf: `.timings` accumulates per-stage wall time (synchronized) for bottleneck analysis.
 """
 from __future__ import annotations
-import sys, time
+import sys, time, os
 from pathlib import Path
 import numpy as np
 import torch
@@ -132,7 +132,8 @@ class DeviceResidentTrainer:
 
             # ===== A: raster backward (grid-sharded) =====
             gv, cgv = fused_backward_grid(dev, cxv, cyv, av, bv, ccv, opv, colv,
-                                          tile_lists, ntx, Hp // 32, Wp, Hp, gp, Tfin)
+                                          tile_lists, ntx, Hp // 32, Wp, Hp, gp, Tfin,
+                                          stage=os.environ.get("TT_FB_STAGE", "s3"))   # Stage 3 default
             for key in _GEOM:
                 grads2d[key][vidx] = gv[key]
             for k in range(3):
