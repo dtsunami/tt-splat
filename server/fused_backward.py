@@ -91,12 +91,13 @@ WRITER_RED = r"""
 #include "dataflow_api.h"
 void kernel_main() {
     uint32_t sx=get_arg_val<uint32_t>(0), sy=get_arg_val<uint32_t>(1), nb=get_arg_val<uint32_t>(2), K=get_arg_val<uint32_t>(3);
-    uint32_t base=get_arg_val<uint32_t>(4);   // packed output tile/core: scalar -> logical [g, j*4] (16B-aligned)
+    uint32_t base=get_arg_val<uint32_t>(4);   // output base; scalar -> logical [g, j*4] (16B-aligned)
+    uint32_t toff=get_arg_val<uint32_t>(5);   // float offset of this chunk's tile in the accumulator (S3); 0 for S2
     for (uint32_t g=0; g<K; g++)              // 4-byte noc writes MUST be 16B-aligned (col stride 4 floats)
         for (uint32_t j=0; j<7; j++) {
             uint32_t col = j*4;                                   // logical column (0,4,8,...,24)
             uint32_t face = (col < 16) ? 0u : 1u;                 // tile face0=cols0-15, face1=cols16-31
-            uint32_t off  = (face*256u + g*16u + (col - face*16u)) * 4u;   // byte offset in tile storage
+            uint32_t off  = (toff + face*256u + g*16u + (col - face*16u)) * 4u;   // byte offset
             cb_wait_front(16,1);
             noc_async_write(get_read_ptr(16), get_noc_addr(sx,sy, base + off), 4);
             noc_async_write_barrier();
@@ -149,7 +150,9 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
 
     import os as _os, time as _time
     _PROF = _os.environ.get("FB_PROF", "0") == "1"
-    _S2 = _os.environ.get("FB_S2", "0") == "1"     # Stage 2: fused in-kernel reduce + compact readback
+    _S3 = _os.environ.get("FB_S3", "0") == "1"     # Stage 3: on-device accumulate, drain ONCE per channel
+    _S2 = _os.environ.get("FB_S2", "0") == "1" and not _S3   # Stage 2: in-kernel reduce, per-chunk readback
+    _red = _S2 or _S3                              # both need the fp32 reduce dispatch
     _tac = {"alloc": 0.0, "args": 0.0, "prog": 0.0, "disp": 0.0, "readback": 0.0, "accum": 0.0}
     def _now(): return _time.perf_counter()
     # ---- STAGE 1: precompute channel-INVARIANT geometry args ONCE; patch only `col` per channel ----
@@ -172,7 +175,9 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
                 geo_args[(c, gx, gy)] = (cargs, real)
     outs = [_block(dev, grid, GY * SHF, Wp, SHF) for _ in range(7)]   # dispatch-1 (m17) products in L1
     out_addrs = [o.buffer_address() for o in outs]
-    if _S2:                                          # dispatch-2 compact output: ONE tile/core, scalar at [g,j]
+    if _S3:                                          # drain-once accumulator: nbatch tiles/core (chunk c -> tile c)
+        out_acc = _block(dev, grid, GY * nbatch * TS, GX * TS, nbatch * TS)
+    elif _S2:                                         # per-chunk compact output: ONE tile/core, scalar at [g, j*4]
         out_s2 = _block(dev, grid, GY * TS, GX * TS, TS)
     _tac["args"] += _now() - _t
 
@@ -206,22 +211,24 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
                 semaphores=[], cbs=[cbf(i, 2) for i in (0, 1, 2, 24, 25, 26, 27)] + [cbf(i, 3) for i in range(16, 23)])
             _tac["prog"] += _now() - _t; _t = _now()
             ttnn.generic_op([PXt, outs[0]], prog)
-            if _S2:                                       # dispatch-2: fp32 reduce each L1 product tile -> scalar
+            if _red:                                      # dispatch-2: fp32 reduce each L1 product tile -> scalar
+                out_t = out_acc if _S3 else out_s2
+                toff = c * (TS * TS) if _S3 else 0         # chunk c -> its own tile in the accumulator
                 rr, rc, rw = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
                 for gx in range(GX):
                     for gy in range(GY):
                         sx, sy = coords[(gx, gy)]
                         rr[gx][gy] = [sx, sy, NB, FUSED_K] + out_addrs
                         rc[gx][gy] = []
-                        rw[gx][gy] = [sx, sy, NB, FUSED_K, out_s2.buffer_address()]
+                        rw[gx][gy] = [sx, sy, NB, FUSED_K, out_t.buffer_address(), toff]
                 cfg32 = ttnn.ComputeConfigDescriptor(); cfg32.fp32_dest_acc_en = True
                 prog2 = ttnn.ProgramDescriptor(kernels=[
                     ks(READER_RED, rr, ttnn.ReaderConfigDescriptor()),
                     ks(COMPUTE_RED, rc, cfg32, [FUSED_K]),
                     ks(WRITER_RED, rw, ttnn.WriterConfigDescriptor())],
                     semaphores=[], cbs=[cbf(0, 4), cbf(16, 4), cbf(23, 1)])
-                ttnn.generic_op([outs[0], out_s2], prog2)
-                if _os.environ.get("FB_DBG", "0") == "1" and k == 0 and c == 0:
+                ttnn.generic_op([outs[0], out_t], prog2)
+                if _S2 and _os.environ.get("FB_DBG", "0") == "1" and k == 0 and c == 0:
                     dbg = ttnn.to_torch(out_s2).reshape(GY, TS, GX, TS)
                     for j, o in enumerate(outs):
                         ref_full = ttnn.to_torch(o).reshape(GY, FUSED_K, TS, GX, TS).sum(dim=(2, 4))
@@ -230,24 +237,41 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
                         print(f"   DBG out[{j}]={_NAMES[j]:3}: dev-reduce vs host-sum-of-same-products "
                               f"max_abs={e:.3e} rel={e/s:.3e}", flush=True)
             _tac["disp"] += _now() - _t; _t = _now()
-            if _S2:    # ONE small readback; fp32-reduced scalar lives at logical [g, j*4] (16B-aligned writes)
-                tt = ttnn.to_torch(out_s2).reshape(GY, TS, GX, TS)
-                hs = [tt[:, :FUSED_K, :, j * 4].numpy() for j in range(7)]
-            else:
-                # reduce each [GY*FK*TS, GX*TS] output to per-(tile-row, slot, tile-col) scalars in ONE torch op
-                hs = [ttnn.to_torch(o).reshape(GY, FUSED_K, TS, GX, TS).sum(dim=(2, 4)).numpy() for o in outs]
+            if not _S3:                                   # S2 / baseline: readback + accumulate PER CHUNK
+                if _S2:    # ONE small readback; fp32-reduced scalar at logical [g, j*4] (16B-aligned writes)
+                    tt = ttnn.to_torch(out_s2).reshape(GY, TS, GX, TS)
+                    hs = [tt[:, :FUSED_K, :, j * 4].numpy() for j in range(7)]
+                else:
+                    # reduce each [GY*FK*TS, GX*TS] output to per-(tile-row, slot, tile-col) scalars in ONE torch op
+                    hs = [ttnn.to_torch(o).reshape(GY, FUSED_K, TS, GX, TS).sum(dim=(2, 4)).numpy() for o in outs]
+                _tac["readback"] += _now() - _t; _t = _now()
+                for gx in range(GX):                      # vectorized over slots (no per-element float())
+                    for gy in range(GY):
+                        lst, _ = tile_chunk(gy * ntx + gx, c)
+                        if not lst:
+                            continue
+                        idx = np.asarray(lst); L = idx.shape[0]
+                        for gi_i, name in enumerate(_NAMES):
+                            vals = hs[gi_i][gy, :L, gx]
+                            (colg[k] if name == "col" else geomg[name])[idx] += vals
+                _tac["accum"] += _now() - _t
+            St, Tt = Sout, Tout
+        if _S3:                                           # Stage 3: drain the accumulator ONCE per channel
+            _t = _now()
+            tt = ttnn.to_torch(out_acc).reshape(GY, nbatch, TS, GX, TS)   # [gy, chunk, row, gx, col]
             _tac["readback"] += _now() - _t; _t = _now()
-            for gx in range(GX):                          # 9 tiles, vectorized over slots (no per-element float())
+            for gx in range(GX):
                 for gy in range(GY):
-                    lst, _ = tile_chunk(gy * ntx + gx, c)
-                    if not lst:
+                    rev = tile_lists[gy * ntx + gx][::-1]
+                    L = len(rev)
+                    if not L:
                         continue
-                    idx = np.asarray(lst); L = idx.shape[0]
+                    idx = np.asarray(rev)
+                    block = tt[gy, :, :FUSED_K, gx, :].reshape(nbatch * FUSED_K, TS)   # row = chunk*FK+slot = rev idx
                     for gi_i, name in enumerate(_NAMES):
-                        vals = hs[gi_i][gy, :L, gx]
+                        vals = block[:L, gi_i * 4].numpy()
                         (colg[k] if name == "col" else geomg[name])[idx] += vals
             _tac["accum"] += _now() - _t
-            St, Tt = Sout, Tout
     if _PROF:
         print("      [fb_grid] " + "  ".join(f"{kk}={1e3*vv:.1f}" for kk, vv in _tac.items())
               + f"  nbatch={nbatch} tiles={GX*GY}", flush=True)

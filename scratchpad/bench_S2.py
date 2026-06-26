@@ -35,23 +35,23 @@ dev = ttnn.open_device(device_id=0)
 os.environ["FB_PROF"] = "1"
 try:
     print(f"scene: SZ={SZ} N={N} tiles={nx}x{ny} maxc={maxc} nbatch={nbatch} cluster={CLUSTER}", flush=True)
+    import time
     res = {}
-    for s2 in ("0", "1"):
-        os.environ["FB_S2"] = s2
-        # warm (JIT) + timed
-        import time
-        FB.fused_backward_grid(dev, cx, cy, a, b, c, op, col, tl, ntx, nty, Wp, Hp, gi, Tfin)
+    for s2, s3, name in (("0", "0", "baseline"), ("1", "0", "S2"), ("0", "1", "S3")):
+        os.environ["FB_S2"] = s2; os.environ["FB_S3"] = s3
+        FB.fused_backward_grid(dev, cx, cy, a, b, c, op, col, tl, ntx, nty, Wp, Hp, gi, Tfin)   # warm (JIT)
         t0 = time.perf_counter()
         g, cg = FB.fused_backward_grid(dev, cx, cy, a, b, c, op, col, tl, ntx, nty, Wp, Hp, gi, Tfin)
         wall = 1e3 * (time.perf_counter() - t0)
-        res[s2] = (g, cg, wall)
-        print(f"  FB_S2={s2}  total_wall={wall:.1f} ms", flush=True)
-    # correctness: S2 vs baseline
-    g0, c0, _ = res["0"]; g1, c1, _ = res["1"]
+        res[name] = (g, cg, wall)
+        print(f"  {name:9s} total_wall={wall:.1f} ms", flush=True)
+    g0, c0, _ = res["baseline"]
     scale = max(abs(g0[k]).max() for k in g0) + 1e-9
-    worst = max((abs(g1[k] - g0[k]).max() / scale) for k in g0)
-    worst = max(worst, max((abs(c1[k] - c0[k]).max() / scale) for k in range(3)))
-    print(f"  S2 vs baseline worst rel = {worst:.2e} -> {'OK' if worst < 2e-2 else 'FAIL'}", flush=True)
-    print(f"  SPEEDUP total = {res['0'][2] / res['1'][2]:.2f}x", flush=True)
+    for name in ("S2", "S3"):
+        g1, c1, _ = res[name]
+        worst = max((abs(g1[k] - g0[k]).max() / scale) for k in g0)
+        worst = max(worst, max((abs(c1[k] - c0[k]).max() / scale) for k in range(3)))
+        print(f"  {name} vs baseline worst rel = {worst:.2e} -> {'OK' if worst < 2e-2 else 'FAIL'}  "
+              f"SPEEDUP={res['baseline'][2] / res[name][2]:.2f}x", flush=True)
 finally:
     ttnn.close_device(dev)
