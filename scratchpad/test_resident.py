@@ -46,7 +46,7 @@ try:
     print(f"(1) grad-equivalence vs host-autograd render_train  (loss host {float(loss):.6f} / resident {l0:.6f})")
     worst = 0.0
     for k in OPT:
-        gd = tr.last_g3[k].double()
+        gd = ttnn.to_torch(tr.last_g3[k]).double()        # grads are device-resident (ttnn) now
         rel = (gd - ref[k]).norm().item() / (ref[k].norm().item() + 1e-12)
         worst = max(worst, rel)
         print(f"    grad[{k:5}] rel={rel:.2e}")

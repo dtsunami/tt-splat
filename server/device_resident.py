@@ -147,11 +147,11 @@ class DeviceResidentTrainer:
                   op=grads2d["op"], colR=col_g[0], colG=col_g[1], colB=col_g[2])
         Pd = dict(mean=p["mean"], scale=p["scale"], quat=p["quat"], sh=p["sh"], op=p["op"], deg=self.deg)
         _dbg("D: project_backward...")
-        g3 = project_backward(dev, Pd, cam, up, aux=(Ageo, Acol))
-        self.last_g3 = g3                                  # for the grad-equivalence gate
+        g3 = project_backward(dev, Pd, cam, up, aux=(Ageo, Acol), return_ttnn=True)  # grads stay resident
+        self.last_g3 = g3                                  # ttnn; grad-equivalence gate reads via to_torch
         _sync(dev); t6 = time.perf_counter(); self.timings["D"] += t6 - t5
 
-        # ===== C: device Adam (updates resident params) =====
+        # ===== C: device Adam (resident grads -> NO host round-trip) =====
         _dbg("C: adam.step...")
         self.adam.step({k: g3[k] for k in ("mean", "scale", "quat", "op", "sh")})
         _sync(dev); t7 = time.perf_counter(); self.timings["C"] += t7 - t6
