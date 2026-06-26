@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Adam, for humans — a rolling-ball cartoon</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --ink:#e6edf3; --dim:#9aa7b4; --adam:#3fd0ff; --sgd:#ff9d42;
+          --grad:#ff5d6c; --mom:#7c9cff; --var:#ffd166; --line:#2a3340; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:18px 22px 6px; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  .sub { color:var(--dim); max-width:900px; }
+  .wrap { display:flex; gap:18px; flex-wrap:wrap; padding:14px 22px 30px; }
+  canvas { background:#0a0d12; border:1px solid var(--line); border-radius:10px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; width:380px; }
+  .panel h2 { font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin:0 0 10px; }
+  .row { display:flex; align-items:center; gap:10px; margin:9px 0; }
+  .row .lab { width:128px; color:var(--dim); }
+  .row .lab b { color:var(--ink); }
+  .bar { flex:1; height:12px; background:#0a0d12; border-radius:6px; overflow:hidden; position:relative; }
+  .bar > i { position:absolute; left:50%; top:0; bottom:0; display:block; }
+  .num { width:74px; text-align:right; font-variant-numeric:tabular-nums; color:var(--ink); }
+  .swatch { width:12px; height:12px; border-radius:3px; display:inline-block; vertical-align:-1px; margin-right:6px; }
+  .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:0 22px 8px; }
+  button { background:#21304a; color:var(--ink); border:1px solid #34507a; border-radius:8px; padding:8px 14px; cursor:pointer; font-size:14px; }
+  button:hover { background:#2b3f60; }
+  button.primary { background:#1d6fd0; border-color:#3a8de8; }
+  .slider { display:flex; align-items:center; gap:8px; color:var(--dim); }
+  .slider input { width:120px; }
+  code { background:#0a0d12; padding:1px 6px; border-radius:5px; color:#cde8ff; }
+  .formula { background:#0a0d12; border:1px solid var(--line); border-radius:8px; padding:12px; margin-top:6px; font-size:13.5px; }
+  .formula .live { color:var(--adam); font-variant-numeric:tabular-nums; }
+  .legend { color:var(--dim); font-size:13px; padding:2px 22px 22px; max-width:960px; }
+  .legend b { color:var(--ink); }
+  .tag { display:inline-block; font-size:11px; padding:1px 7px; border-radius:10px; border:1px solid var(--line); color:var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Adam, for humans 🎢</h1>
+  <div class="sub">A ball rolls downhill on a <b>loss landscape</b> (darker = better). Training = find the lowest point.
+  Plain gradient descent (<span style="color:var(--sgd)">orange</span>) zig-zags across the narrow valley.
+  <b>Adam</b> (<span style="color:var(--adam)">cyan</span>) adds two memories — <span style="color:var(--mom)">momentum</span>
+  and <span style="color:var(--var)">per-direction caution</span> — and glides straight down. This is the exact algorithm
+  running on the Blackhole as our device-resident optimizer (Stage&nbsp;C).</div>
+</header>
+
+<div class="controls">
+  <button id="play" class="primary">▶ Play</button>
+  <button id="step">Step ▷</button>
+  <button id="reset">↺ Reset</button>
+  <span class="slider">β₁ momentum <input id="b1" type="range" min="0" max="0.98" step="0.01" value="0.9"><span id="b1v">0.90</span></span>
+  <span class="slider">β₂ caution <input id="b2" type="range" min="0.9" max="0.9999" step="0.0001" value="0.999"><span id="b2v">0.999</span></span>
+  <span class="slider">lr <input id="lr" type="range" min="0.02" max="0.6" step="0.01" value="0.25"><span id="lrv">0.25</span></span>
+</div>
+
+<div class="wrap">
+  <canvas id="cv" width="560" height="460"></canvas>
+  <div class="panel">
+    <h2>What Adam is thinking · step <span id="t">0</span></h2>
+
+    <div class="row"><span class="lab"><span class="swatch" style="background:var(--grad)"></span><b>gradient</b> g<br><span style="font-size:12px">“which way is downhill <i>now</i>” (jittery)</span></span></div>
+    <div class="row"><span class="lab">x</span><div class="bar"><i id="gx" style="background:var(--grad)"></i></div><span class="num" id="gxn">0</span></div>
+    <div class="row"><span class="lab">y</span><div class="bar"><i id="gy" style="background:var(--grad)"></i></div><span class="num" id="gyn">0</span></div>
+
+    <div class="row" style="margin-top:14px"><span class="lab"><span class="swatch" style="background:var(--mom)"></span><b>m</b> = momentum (β₁)<br><span style="font-size:12px">smoothed velocity — builds speed in steady directions</span></span></div>
+    <div class="row"><span class="lab">x</span><div class="bar"><i id="mx" style="background:var(--mom)"></i></div><span class="num" id="mxn">0</span></div>
+    <div class="row"><span class="lab">y</span><div class="bar"><i id="my" style="background:var(--mom)"></i></div><span class="num" id="myn">0</span></div>
+
+    <div class="row" style="margin-top:14px"><span class="lab"><span class="swatch" style="background:var(--var)"></span><b>v</b> = caution (β₂)<br><span style="font-size:12px">running avg of g² — how bumpy this axis is</span></span></div>
+    <div class="row"><span class="lab">x</span><div class="bar"><i id="vx" style="background:var(--var)"></i></div><span class="num" id="vxn">0</span></div>
+    <div class="row"><span class="lab">y</span><div class="bar"><i id="vy" style="background:var(--var)"></i></div><span class="num" id="vyn">0</span></div>
+
+    <div class="formula">
+      step = lr · <b style="color:var(--mom)">m̂</b> / (√<b style="color:var(--var)">v̂</b> + ε)<br>
+      <span style="color:var(--dim)">big caution v ⇒ small step (don’t overshoot a steep wall)</span><br>
+      <span style="color:var(--dim)">small caution v ⇒ big step (cruise across flat ground)</span><br>
+      x: lr·<span class="live" id="sx">0</span> &nbsp;&nbsp; y: lr·<span class="live" id="sy">0</span>
+    </div>
+    <div style="margin-top:10px; color:var(--dim); font-size:12.5px">
+      <span class="tag">bias-correct</span> early on m,v start at 0, so the first steps are scaled up by
+      1/(1−βᵗ) — that’s the “warm-up” you see at step 1–10.
+    </div>
+  </div>
+</div>
+
+<div class="legend">
+  <b>How to read it.</b> The <span style="color:var(--grad)">red arrow</span> is the raw gradient (noisy). The
+  <span style="color:var(--mom)">blue arrow</span> is momentum <code>m</code> — the average of recent gradients, so it
+  cancels the side-to-side jitter and points down the valley. <code>v</code> (yellow) quietly measures how steep each
+  axis has been; Adam divides the step by <code>√v</code>, so the <i>steep</i> axis (across the valley) gets tiny steps
+  while the <i>flat</i> axis (along the valley) gets big ones — that’s why cyan goes straight where orange bounces.
+  Try dropping <b>β₁ to 0</b> (no momentum → jitter returns) or <b>β₂ to 0.9</b> (short caution memory → less adaptive).
+</div>
+
+<script>
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height;
+// loss surface: an ill-conditioned bowl — narrow valley along x, steep along y
+const A = 0.05, B = 1.0;                     // f = 0.5(A x^2 + B y^2)
+const f = (x,y) => 0.5*(A*x*x + B*y*y);
+const grad = (x,y) => [A*x, B*y];
+// world<->screen: world x in [-11,11], y in [-7,7]
+const WX=11, WY=7;
+const toX = x => (x+WX)/(2*WX)*W, toY = y => (1-(y+WY)/(2*WY))*H;
+
+let st, sgd, params, paused=true, acc=0;
+function reset(){
+  st = {x:-9.2, y:5.6, m:[0,0], v:[0,0], t:0, g:[0,0], shat:[0,0], trail:[]};
+  sgd = {x:-9.2, y:5.6, trail:[]};
+  draw();
+  updatePanel();
+}
+function readControls(){
+  params = { b1:+b1.value, b2:+b2.value, lr:+lr.value, eps:1e-8 };
+  b1v.textContent=(+b1.value).toFixed(2); b2v.textContent=(+b2.value).toFixed(4); lrv.textContent=(+lr.value).toFixed(2);
+}
+['b1','b2','lr'].forEach(id=>document.getElementById(id).addEventListener('input',readControls));
+
+function noitoY(g){ // a little gradient noise so momentum visibly helps
+  return [g[0]+(Math.random()-0.5)*0.6, g[1]+(Math.random()-0.5)*0.6];
+}
+function adamStep(){
+  const {b1,b2,lr,eps}=params;
+  st.t++;
+  const g = noitoY(grad(st.x,st.y)); st.g=g;
+  for(let i=0;i<2;i++){
+    st.m[i]=b1*st.m[i]+(1-b1)*g[i];
+    st.v[i]=b2*st.v[i]+(1-b2)*g[i]*g[i];
+  }
+  const c1=1-Math.pow(b1,st.t), c2=1-Math.pow(b2,st.t);
+  const upd=[0,0];
+  for(let i=0;i<2;i++){
+    const mhat=st.m[i]/c1, vhat=st.v[i]/c2;
+    st.shat[i]=mhat/(Math.sqrt(vhat)+eps);    // the step shape (before lr)
+    upd[i]=lr*st.shat[i];
+  }
+  st.trail.push([st.x,st.y]); if(st.trail.length>400) st.trail.shift();
+  st.x-=upd[0]; st.y-=upd[1];
+  // plain SGD ghost, same lr, raw gradient (no memory) -> zig-zag
+  const sg=grad(sgd.x,sgd.y);
+  sgd.trail.push([sgd.x,sgd.y]); if(sgd.trail.length>400) sgd.trail.shift();
+  sgd.x-=lr*sg[0]; sgd.y-=lr*sg[1];
+}
+
+function draw(){
+  // heatmap
+  const img=ctx.createImageData(W,H);
+  let fmax=f(WX,WY);
+  for(let py=0;py<H;py++)for(let px=0;px<W;px++){
+    const wx=px/W*2*WX-WX, wy=(1-py/H)*2*WY-WY, val=f(wx,wy)/fmax;
+    const t=Math.pow(val,0.4); const idx=(py*W+px)*4;
+    img.data[idx]  = 12+ t*36;
+    img.data[idx+1]= 18+ t*70;
+    img.data[idx+2]= 28+ t*120;
+    img.data[idx+3]= 255;
+  }
+  ctx.putImageData(img,0,0);
+  // contour rings
+  ctx.strokeStyle='rgba(255,255,255,0.07)'; ctx.lineWidth=1;
+  for(let lv=0.3;lv<6;lv*=1.7){ ctx.beginPath();
+    for(let a=0;a<=6.3;a+=0.05){ const rx=Math.sqrt(2*lv/A)*Math.cos(a), ry=Math.sqrt(2*lv/B)*Math.sin(a);
+      const X=toX(rx),Y=toY(ry); a===0?ctx.moveTo(X,Y):ctx.lineTo(X,Y);} ctx.stroke(); }
+  // target
+  ctx.fillStyle='#4ade80'; ctx.beginPath(); ctx.arc(toX(0),toY(0),4,0,6.3); ctx.fill();
+  // SGD trail+ball
+  drawTrail(sgd.trail, 'rgba(255,157,66,0.55)', true);
+  ball(sgd.x,sgd.y,'#ff9d42',5);
+  // Adam trail+ball
+  drawTrail(st.trail, 'rgba(63,208,255,0.85)', false);
+  ball(st.x,st.y,'#3fd0ff',6);
+  // arrows from Adam ball: gradient (red), momentum (blue)
+  arrow(st.x,st.y,-st.g[0],-st.g[1],'#ff5d6c',1.4);
+  arrow(st.x,st.y,-st.m[0],-st.m[1],'#7c9cff',1.4);
+}
+function drawTrail(tr,color,dashed){ if(tr.length<2)return; ctx.strokeStyle=color; ctx.lineWidth=2;
+  ctx.setLineDash(dashed?[5,4]:[]); ctx.beginPath();
+  tr.forEach((p,i)=>{const X=toX(p[0]),Y=toY(p[1]); i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);}); ctx.stroke(); ctx.setLineDash([]); }
+function ball(x,y,c,r){ ctx.fillStyle=c; ctx.shadowColor=c; ctx.shadowBlur=12; ctx.beginPath(); ctx.arc(toX(x),toY(y),r,0,6.3); ctx.fill(); ctx.shadowBlur=0; }
+function arrow(x,y,dx,dy,c,scale){ const X=toX(x),Y=toY(y),X2=toX(x+dx*scale),Y2=toY(y+dy*scale);
+  ctx.strokeStyle=c; ctx.fillStyle=c; ctx.lineWidth=2.5; ctx.beginPath(); ctx.moveTo(X,Y); ctx.lineTo(X2,Y2); ctx.stroke();
+  const ang=Math.atan2(Y2-Y,X2-X); ctx.beginPath(); ctx.moveTo(X2,Y2);
+  ctx.lineTo(X2-9*Math.cos(ang-0.4),Y2-9*Math.sin(ang-0.4)); ctx.lineTo(X2-9*Math.cos(ang+0.4),Y2-9*Math.sin(ang+0.4));
+  ctx.closePath(); ctx.fill(); }
+
+function bar(id,val,scale){ const e=document.getElementById(id); const w=Math.max(-1,Math.min(1,val/scale))*50;
+  e.style.width=Math.abs(w)+'%'; e.style.left=(w<0?50+w:50)+'%'; }
+function updatePanel(){
+  document.getElementById('t').textContent=st.t;
+  const g=st.g,m=st.m,v=st.v;
+  bar('gx',g[0],8); bar('gy',g[1],8); gxn.textContent=g[0].toFixed(2); gyn.textContent=g[1].toFixed(2);
+  bar('mx',m[0],8); bar('my',m[1],8); mxn.textContent=m[0].toFixed(2); myn.textContent=m[1].toFixed(2);
+  bar('vx',v[0],10); bar('vy',v[1],10); vxn.textContent=v[0].toFixed(2); vyn.textContent=v[1].toFixed(2);
+  sxe(); }
+function sxe(){ document.getElementById('sx').textContent=st.shat[0].toFixed(3); document.getElementById('sy').textContent=st.shat[1].toFixed(3); }
+
+let raf;
+function loop(ts){ if(!paused){ acc+=16; if(acc>70){ acc=0; adamStep(); draw(); updatePanel(); } } raf=requestAnimationFrame(loop); }
+play.onclick=()=>{ paused=!paused; play.textContent=paused?'▶ Play':'⏸ Pause'; play.classList.toggle('primary',paused); };
+step.onclick=()=>{ adamStep(); draw(); updatePanel(); };
+reset.onclick=reset;
+readControls(); reset(); raf=requestAnimationFrame(loop);
+</script>
+</body>
+</html>
