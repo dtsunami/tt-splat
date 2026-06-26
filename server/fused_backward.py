@@ -78,14 +78,20 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
         lst = tile_lists[t][::-1][c * FUSED_K:(c + 1) * FUSED_K]
         return lst, lst + [None] * (FUSED_K - len(lst))
 
+    import os as _os, time as _time
+    _PROF = _os.environ.get("FB_PROF", "0") == "1"
+    _tac = {"alloc": 0.0, "args": 0.0, "prog": 0.0, "disp": 0.0, "readback": 0.0, "accum": 0.0}
+    def _now(): return _time.perf_counter()
     for k in range(3):
         dLt = _block(dev, grid, Hp, Wp, TS, torch.from_numpy(gi[:, :, k].copy()))
         Tt = _block(dev, grid, Hp, Wp, TS, torch.from_numpy(Tfin.copy()))
         St = _block(dev, grid, Hp, Wp, TS, torch.zeros(Hp, Wp))
         for c in range(nbatch):
+            _t = _now()
             outs = [_block(dev, grid, GY * SHF, Wp, SHF) for _ in range(7)]
             Sout = _block(dev, grid, Hp, Wp, TS)
             Tout = _block(dev, grid, Hp, Wp, TS)
+            _tac["alloc"] += _now() - _t; _t = _now()
             rt_r, rt_c, rt_w = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
             for gx in range(GX):
                 for gy in range(GY):
@@ -102,28 +108,32 @@ def fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tile_lists, ntx, n
                                   f2u(q["op"]), f2u(q["col"]), f2u(q["b"])]
                     rt_c[gx][gy] = cargs
                     rt_w[gx][gy] = [sx, sy, FUSED_K, NB] + [o.buffer_address() for o in outs]
+            _tac["args"] += _now() - _t; _t = _now()
             prog = ttnn.ProgramDescriptor(kernels=[
                 ks(READER, rt_r, ttnn.ReaderConfigDescriptor()),
                 ks(COMPUTE, rt_c, ttnn.ComputeConfigDescriptor(), [FUSED_K]),
                 ks(WRITER, rt_w, ttnn.WriterConfigDescriptor())],
                 semaphores=[], cbs=[cbf(i, 2) for i in (0, 1, 2, 24, 25, 26, 27)] + [cbf(i, 3) for i in range(16, 23)])
+            _tac["prog"] += _now() - _t; _t = _now()
             ttnn.generic_op([PXt, outs[0]], prog)
-            host = [ttnn.to_torch(o).reshape(GY * SHF, Wp) for o in outs]   # [GY*FK*32, GX*32]
-            for gx in range(GX):
+            _tac["disp"] += _now() - _t; _t = _now()
+            # reduce each [GY*FK*TS, GX*TS] output to per-(tile-row, slot, tile-col) scalars in ONE torch op
+            hs = [ttnn.to_torch(o).reshape(GY, FUSED_K, TS, GX, TS).sum(dim=(2, 4)).numpy() for o in outs]
+            _tac["readback"] += _now() - _t; _t = _now()
+            for gx in range(GX):                          # 9 tiles, vectorized over slots (no per-element float())
                 for gy in range(GY):
-                    t = gy * ntx + gx
-                    lst, _ = tile_chunk(t, c)
+                    lst, _ = tile_chunk(gy * ntx + gx, c)
                     if not lst:
                         continue
+                    idx = np.asarray(lst); L = idx.shape[0]
                     for gi_i, name in enumerate(_NAMES):
-                        shard = host[gi_i][gy * SHF:(gy + 1) * SHF, gx * TS:(gx + 1) * TS].reshape(FUSED_K, TS, TS)
-                        s = shard.reshape(FUSED_K, -1).sum(dim=1)
-                        for j, idx in enumerate(lst):
-                            if name in ("cx", "cy", "a", "b", "c", "op"):
-                                geomg[{"cx": "cx", "cy": "cy", "a": "a", "b": "b", "c": "c", "op": "op"}[name]][idx] += float(s[j])
-                            else:
-                                colg[k][idx] += float(s[j])
+                        vals = hs[gi_i][gy, :L, gx]
+                        (colg[k] if name == "col" else geomg[name])[idx] += vals
+            _tac["accum"] += _now() - _t
             St, Tt = Sout, Tout
+    if _PROF:
+        print("      [fb_grid] " + "  ".join(f"{kk}={1e3*vv:.1f}" for kk, vv in _tac.items())
+              + f"  nbatch={nbatch} tiles={GX*GY}", flush=True)
     return geomg, colg
 
 

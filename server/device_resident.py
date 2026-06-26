@@ -58,6 +58,7 @@ class DeviceResidentTrainer:
         self.adam = DeviceAdam(dev, init, lr)              # params + m/v resident on device
         self.timings = {k: 0.0 for k in ("B", "bin", "raster", "loss", "A", "D", "C", "step")}
         self.nstep = 0
+        self.step_log = []          # per-step {stage: ms} — for profiling the ramp/stall curve
 
     # ---- resident params (ttnn) ----
     @property
@@ -157,6 +158,10 @@ class DeviceResidentTrainer:
         _sync(dev); t7 = time.perf_counter(); self.timings["C"] += t7 - t6
         self.timings["step"] += t7 - t0
         self.nstep += 1
+        self.step_log.append(dict(
+            B=1e3 * (t1 - t0), bin=1e3 * (t2 - t1) if vidx.size else 0.0,
+            raster=1e3 * (t3 - t2) if vidx.size else 0.0, A=1e3 * (t5 - t4) if vidx.size else 0.0,
+            D=1e3 * (t6 - t5), C=1e3 * (t7 - t6), step=1e3 * (t7 - t0)))
         return loss, img.astype(np.float32)
 
     def params_host(self):
