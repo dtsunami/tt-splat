@@ -52,11 +52,16 @@ durability win all three judges converged on.
   (<1e-2).
 
 ## Sequencing — every step ends at a silicon-verified gate
-- **Step 0 — SPIKE (≤1 day, gates everything).** In `scratchpad/`, prove on silicon the load-bearing
-  unknowns: (a) **fp32_dest_acc_en + 8-reg dst-resident MAC chains** (UNPROVEN — m17 is bf16-16); (b) `gt`/`lt`
-  masks (cmask/zmask); (c) forward `sqrt`/`sigmoid`/`clamp`/`maximum`. Pre-committed fallbacks: sigmoid =
-  recip(1+exp(−x)); masks via relu-difference or a residual ttnn mul. If fp32-8 doesn't hold, we learn it in a
-  day, not a month.
+- **Step 0 — SPIKE — DONE ✅ GREEN (`scratchpad/proto_fp32_spike.py`, silicon).** Proved the load-bearing
+  unknowns: (a) **fp32_dest_acc_en + 8-reg dst-resident MAC chains pass the 1e-2 gate** — conic chain
+  (a*c−b*b→1/det→ca/cb/cc) rel **1.55e-3**, 8-term signed accumulation **1.14e-3**; the **bf16 contrast FAILS
+  1e-2** (1.67e-2 / 1.22e-2) → `fp32_dest_acc_en` is necessary AND sufficient. (b) masks `gtz_tile` +
+  `unary_lt_tile` → cmask exact (0.0). (c) `sqrt_tile` 2e-4, `clamp_tile` 4e-4 (lower-clamp covers
+  z=max(·,1e-4)); `sigmoid_tile` returns garbage on this build → **fallback `1/(1+exp(−x))` = 1.7e-4** (wired).
+  **WATCH-ITEM (new):** fp32-mode floor is ~1.5e-3 not 1e-6 — multiply inputs pass through 19-bit (tf32) SrcA/B
+  even with fp32 dst-accum. Moderate chains pass 1e-2 with margin; **long geometry contraction chains
+  (gscale/gquat) accumulate ~sqrt(nops)·1.5e-3 of error**, so the "compute G once + keep chains short via
+  group-split" rule is a PRECISION safeguard, not just perf. Add a per-group readback micro-gate to catch drift.
 - **Step 1 — backend refactor, byte-identical (~2 days).** Land `backend.py` (TtnnBackend default), thread `B`.
   Gate: test_proj + test_proj_bwd pass **byte-identically** (pure refactor).
 - **Step 2 — SHIP THE EASY HALF (~3 days, FIRST REAL WIN).** TraceBackend + NumpyBackend + tilealloc on the
@@ -80,8 +85,9 @@ telemetry + the differential self-check. Mixed-mode (some groups fused, rest on 
 state, so a regressing group falls back to ttnn instead of all-or-nothing.
 
 ## Honest risks (Step-0 must answer before committing)
-1. **fp32 8-reg arithmetic is UNPROVEN** — all judges flagged it. m17 only proved bf16-16; the flag halves dst
-   and reportedly breaks 16-slot arithmetic. The signed grads (conic/gscale/gquat) have no foundation without it.
+1. ~~**fp32 8-reg arithmetic is UNPROVEN**~~ — **RESOLVED Step 0 ✅**: fp32-8 dst-resident chains pass 1e-2
+   (1.5e-3); bf16 fails. Residual: the ~1.5e-3 tf32-input floor means long chains need the G-share/group-split
+   to stay under 1e-2 (see Step-0 watch-item).
 2. **Recompute blowup on geometry** — G feeds GR/gscale/gqn (9–18 co-live tiles); recompute-only could re-derive
    G's 3×3×3 cone at many use-points. Mitigation decided: compute G once + FIFO share + group-split budget cap.
 3. **Allocator is trusted, load-bearing code** — a recompute scheduled across an in-place mutation silently
