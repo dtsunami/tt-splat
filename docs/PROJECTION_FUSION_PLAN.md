@@ -66,10 +66,19 @@ durability win all three judges converged on.
   (Backend ABC + TtnnBackend default); threaded `backend=None` through project_geom/color/op/backward; the
   m/ad/neg/s1 aliases are backend-local (`_aliases(B)`); helpers take `B`; structural ops stay ttnn. Gate:
   test_proj 1.14e-6, test_proj_bwd all OK (7.64e-7) — **byte-identical**; resident loop RESIDENT_TRAIN_TT_OK.
-- **Step 2 — SHIP THE EASY HALF (~3 days, FIRST REAL WIN).** TraceBackend + NumpyBackend + tilealloc on the
-  **SH/color backward group** (gsh/gdir/gmean_color/gop — 18.4 ms, pure muls, bf16, fits 16 regs, ~0 recompute).
-  Host gates first (NumpyBackend==ttnn, reg-sim==NumpyBackend — zero hardware), then silicon. Gate: color-half
-  rel<1e-2; telemetry shows ~18.4 ms → <1 ms. Proves the whole substrate on a real sub-DAG.
+- **Step 2 — SHIP THE EASY HALF — CORE DONE ✅, perf PROVEN, live-wiring remains.** The whole Trace-and-Pack
+  pipeline is built + silicon-verified for the SH/color group: `backend.py` (TraceBackend/NumpyBackend/eval_dag),
+  extracted `_color_op_backward` (one source for ttnn/numpy/trace), `tilealloc.py` (lower = tree-walk recompute
+  + **Sethi-Ullman** ordering → maxreg 6 (fits fp32-8); `partition()` group-split into 4 JIT-sized kernels;
+  `emit_cpp` m17-dialect; `simulate` reg-file oracle), `proj_fused.py` (trace→build→`run_color_fused`).
+  **Layered gates:** trace fidelity (eval_dag==oracle==torch, 0.0/1e-16), emission (simulate==eval_dag 0.0,
+  maxreg 6) — both ZERO hardware; **SILICON** (`test_color_fused`: fused==fp64 oracle worst **4.89e-3** <1e-2 —
+  gop 3.7e-4, gsh 9.2e-4, gmean_color 4.9e-3). **PERF (N=800): fused dispatch-only 0.46 ms vs ttnn 18.9 ms =
+  41× faster.** fp32-8 used (color group has the gmean_color subtraction → fp32, not bf16). KEY learning: pure
+  recompute makes one 150KB kernel that won't JIT-compile → `partition()` group-split (4 kernels: gop+gsh + 3×
+  gmean_color) is the fix; a sharing/recompute allocator would cut the 4739 instrs further (gdir recompute) —
+  follow-on. **REMAINING for the live win:** on-device input assembly (avoid the host round-trip that
+  `run_color_fused` currently does) + wire behind a flag in `project_backward` + D-stage telemetry.
 - **Step 3 — geometry conic/mean chain (~3 days).** fp32-8, moderate recompute. Gate: those columns rel<1e-2.
 - **Step 4 — hard contractions gscale/gquat (~1 week).** Compute shared `G = Rvᵀ gSC Rv` once, share via the
   proven FIFO output-CB (9–18 tiles co-live → G-share is mandatory, not optional). Gate: scale/quat rel<1e-2;
