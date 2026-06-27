@@ -136,9 +136,13 @@ def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None)
     U = {k: (up[k] if isinstance(up[k], ttnn.Tensor) else _t2t(dev, up[k])) for k in up}
 
     # ===== (1)+(2) opacity + SH-color backward (extracted -> one source for ttnn/numpy/trace; fusable) =====
-    op_sig = project_op(dev, P["op"], backend=backend)
-    gop, gsh_t, gmean_color = _color_op_backward(
-        B, lambda k, c: _shcol(dev, sh, k, c), U, AC, op_sig, deg)
+    if __import__("os").environ.get("TT_PROJ_FUSED", "0") == "1":     # fused codegen'd kernel (step 2)
+        from proj_fused import color_backward_fused
+        gop, gsh_t, gmean_color = color_backward_fused(dev, P, up, AC, deg)
+    else:
+        op_sig = project_op(dev, P["op"], backend=backend)
+        gop, gsh_t, gmean_color = _color_op_backward(
+            B, lambda k, c: _shcol(dev, sh, k, c), U, AC, op_sig, deg)
 
     # ===== (3) conic -> Sig2 (a_,b_,c_) =====
     a_, b_, c_, di = A["a_"], A["b_"], A["c_"], A["di"]

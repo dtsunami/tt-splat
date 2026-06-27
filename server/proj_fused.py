@@ -149,3 +149,38 @@ def run_color_fused(dev, inputs, deg):
         ttnn.generic_op([in_t, out_t], prog)
     raw = ttnn.to_torch(out_t).reshape(n_out, _TS * _TS).numpy()
     return {name: raw[slot, :N].copy() for name, slot in out_slots.items()}
+
+
+def color_backward_fused(dev, P, up, AC, deg):
+    """Live drop-in for _color_op_backward via the fused kernel. Reads the device color-aux (AC + the cheap
+    host-side op_sig/sh/up) into one numpy input set, runs the codegen'd kernel, and returns (gop, gsh_t,
+    gmean_color) as ttnn [N] tensors so the rest of project_backward is unchanged. Host I/O (AC readback +
+    output re-upload) is the current cost; on-device assembly is the 41x follow-on. Gated by TT_PROJ_FUSED."""
+    import numpy as np, torch
+    from device_project_backward import _t2t
+    N = P["mean"].shape[0]; K = (deg + 1) ** 2
+    def _tonp(t):                                                       # ttnn / torch / numpy -> numpy
+        if isinstance(t, ttnn.Tensor): return ttnn.to_torch(t).numpy()
+        if torch.is_tensor(t): return t.detach().cpu().numpy()
+        return np.asarray(t)
+    g = lambda t: ttnn.to_torch(t).flatten().numpy()[:N].astype(np.float64)
+    shn = _tonp(P["sh"]).reshape(N, K, 3).astype(np.float64)
+    opl = _tonp(P["op"]).flatten()[:N]
+    op_sig = 1.0 / (1.0 + np.exp(-opl))                                  # sigmoid host-side (no device read)
+    up_np = {k: (g(up[k]) if isinstance(up[k], ttnn.Tensor) else np.asarray(up[k], np.float64)) for k in up}
+    pre = [g(AC["pre"][c]) for c in range(3)]
+    wb = [None] + [g(AC["wb"][k]) for k in range(1, K)]
+    x, y, z, inv = g(AC["x"]), g(AC["y"]), g(AC["z"]), g(AC["inv"])
+    def srcf(kind, *idx):
+        if kind == "op_sig": return op_sig
+        if kind == "inv": return inv
+        if kind == "dir": return {"x": x, "y": y, "z": z}[idx[0]]
+        if kind == "up": return up_np[idx[0]]
+        if kind == "pre": return pre[idx[0]]
+        if kind == "wb": return wb[idx[0]]
+        return shn[:, idx[0], idx[1]]
+    out = run_color_fused(dev, color_inputs(deg, srcf), deg)
+    gop = _t2t(dev, out["gop"])
+    gsh_t = {(k, c): _t2t(dev, out[f"gsh.{k}.{c}"]) for c in range(3) for k in range(K)}
+    gmean_color = [_t2t(dev, out[f"gmean_color.{d}"]) for d in range(3)]
+    return gop, gsh_t, gmean_color
