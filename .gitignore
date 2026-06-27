@@ -8,8 +8,8 @@
 .env
 
 # Build / generated artifacts
-build/
-generated/
+**/build
+**/generated
 
 # work/: keep the input dataset (scene model + source frames), ignore training outputs.
 # NOTE: keep these as own-line comments — gitignore does NOT support inline comments.

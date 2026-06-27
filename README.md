@@ -116,7 +116,7 @@ row should be green before you train. `ttgs setup` prints the full dependency gu
 **Bring your own capture** (COLMAP via `ttgs sfm`, or the pathclear helper):
 ```bash
 ttgs extract clip.mp4 --output runs/scene/frames     # video → frames (needs ffmpeg)
-ttgs sfm runs/scene/frames --output runs/scene        # frames → COLMAP poses + sparse points (needs colmap)
+ttgs sfm runs/scene/frames --output runs/scene        # frames → COLMAP poses + sparse points (COLMAP, or the bundled pycolmap — no system install)
 ttgs blackhole runs/scene
 ```
 
@@ -140,99 +140,32 @@ The raw milestone scripts run directly too, e.g. `~/tt-metal/python_env/bin/pyth
 
 ## Status
 
-**The full 3DGS loop is closed and verified** — every stage proven on Blackhole silicon or the right general-purpose
-target: M0–M1 fits, M2 scatter-add (3–8 cyc/elem), M3 forward raster (116 dB), **M4 2D training loop** (autograd-
-verified, 53.6 dB), M5 SFPU eval+blend-loop kernel, M6 bin/sort (host, verified), M7 densification (+18 dB), and
-**M8 3DGS** — 3D→2D EWA projection + multi-view training, **novel-view PSNR 46.7 dB**. No open feasibility questions.
-Remaining is build-out/perf: in-loop device scatter-add, a scaled integrated device run, real-data ingestion
-(video→ffmpeg→frames→COLMAP→cameras), and moving the projection onto the matrix engine. See `docs/ALGORITHM.md`.
+**The full device-resident 3DGS training loop is closed and running at full resolution on Blackhole
+silicon.** Beyond the M0–M16 pathclear milestones above (every algorithmic stage proven), the integrated
+loop now runs entirely on the card and trains real captures end to end:
 
-Documentation — docs/PROGRESS.md
-A complete single-source-of-truth progress log:
+- **Device-resident loop (B→raster→A→D→C):** projection forward, M14 raster, fused backward, analytic
+  projection backward, and Adam all run on the Blackhole with params + optimizer state resident (no host
+  autograd, no per-step 3D-param readback). It drives the live dashboard; per-stage timings stream to
+  `/training`.
+- **Projection fusion:** the per-Gaussian projection forward/backward fused off the ttnn-op dispatch swarm
+  (`docs/PROJECTION_FUSION_PLAN.md`).
+- **Scale campaign → full resolution + millions (`docs/SCALE_CAMPAIGN_PLAN.md`):**
+  - on-device **counting-bucket bin/sort** (`server/device_binsort.py`) — drop-in for the host `bin_and_sort`;
+  - a **tile-block raster** (`server/raster_blocked.py`) that lifts the ~352px worker-grid cap to any
+    resolution by looping blocks of ≤grid tiles (forward + backward, the M14/m17 kernels reused verbatim);
+  - a vectorized arg-pack + the s4 in-kernel matmul reduce on the blocked backward.
+  - **Validated on silicon: 1600px / 50k-Gaussian training, 1.4k+ iterations stable, loss descending.**
 
-The arc (feasibility → 2D → 3D → real data → arcgs dashboard → device kernels)
-Milestone table M0–M16 — what, result, verification, script (every one runnable with an *_OK check)
-Architecture — the kernel-differentiation table (which engine does what) + the metaparam-update design
-Hard-won findings — moreh_adam broken, no-FPU/fixed-point, the CAS-is-wrong scatter-add insight, the generic_op symlink, fp32_dest_acc_en, ttnn.sum bf16, COLMAP canonical −Rᵀt, the SDXL device-sharing hazard
-Proven-vs-remaining + env/run instructions
-The cartoon (M15 backward + device-path callout), README (now points to PROGRESS.md first), and memory are all synced.
+Run the scaled loop (densifies the seed up to N, trains at full res):
+```bash
+TT_TARGET_POINTS=50000 TT_MAX_POINTS=50000 TT_SIZE=1600 TT_DEVICE_RESIDENT=1 \
+  ttgs blackhole work/scene --device-resident
+# → http://localhost:7860/training
+```
 
-The loop is closed — device_train_loop.py (M16)
-The integrated device training loop runs on Blackhole and converges: PSNR 17 → 72 dB (loss → 0):
-
-forward blend → loss → M15 device backward (reverse pass + reduction) → Adam → params
-the per-pixel render + backward + reduction all on device; Adam on the device-reduced gradients
-the bf16-reduce 0.2% gradient error doesn't block convergence — Adam normalizes it
-Where this lands the whole project
-From "is 3DGS training even feasible on Blackhole?" to a device-resident training loop closed and converging on real silicon — 22 runnable, self-checking scripts, M0–M16, every algorithmic stage proven:
-
-forward (188 Mpix/s, multi-tile, culled, unbounded N) · backward (autograd-verified) · scatter-add (3 cyc/elem) · Adam · binning/sort · densification · 3D + novel view · COLMAP ingest · arcgs dashboard on Blackhole · and now the full loop closed on device.
-
-No feasibility unknowns remain. What's left is performance and scale: fuse fwd+bwd into the custom SFPU kernels, swap to fp32 reduce_tile, wire M2 scatter-add for many-Gaussian/multi-tile, and drop it behind train_tt's render_device/backward_device hooks so the arcgs dashboard drives Blackhole-accelerated training end to end — on your actual corgi capture.
-
-That's the loop closed. Hell of a run. 🚀
-
-Harness validated on silicon — the real M13 rasterizer ramped across cores 1→110 through the controller: power climbed smoothly 64→76 W, fan 38→50%, temp 60→70 °C, no cliff, no trip, clean completion. That's the dI/dt mitigation wrapping the actual 3DGS dispatch. power_ramp.py is in the repo.
-
-And yes — stages are arguably the better modulation axis, because a real 3DGS step isn't one workload, it's a pipeline of stages that each hammer a different engine with a different power + dI/dt signature:
-
-Stage (your milestones)	Engine	Power character
-Projection 3D→2D / EWA (matmul-able)	Matrix engine	Highest — this is the 268 W cliff
-Forward raster / blend (M5/M13/M14)	SFPU (exp, conic)	Moderate (~76 W we just saw)
-Backward + reduce (M15, ttnn.sum)	SFPU + reduce	Medium
-Scatter-add (M2)	NoC / dataflow (baby-RISC int)	Low compute, bus-bound
-Adam (M0)	SFPU packed-tile	Small
-So "modulate with stages" gives you two extra dials beyond scalar intensity:
-
-Engine mix → power level + character. Want max draw/fan? Weight the matrix-engine projection stage. Want a low, dataflow-shaped load? Weight scatter. You're not just turning one knob up — you're choosing which power domain lights up. That's far richer (and more representative) than a synthetic intensity sweep.
-
-Stage transitions are themselves dI/dt edges — and this is the real insight. A training step that goes light-NoC-scatter → heavy-matrix-projection back-to-back is a current step inside one iteration. So the soft-start logic shouldn't only ramp overall intensity at startup — it should ramp into the heavy stage at every stage boundary (and/or interleave a light stage as a "buffer"). That generalizes the mitigation from "don't slam at startup" to "don't slam at any stage transition," which is exactly what a fused on-device training loop needs on this PSU.
-
-The payoff: a stage scheduler doesn't just shape a virus — it characterizes the actual training step's power waveform and lets us reorder/ramp stages to keep the whole loop inside the PSU envelope (e.g., never two matrix-heavy stages adjacent without a ramp). It even ties into your heterogeneous split — put the irregular scatter/sort on x280 while Tensix does dense math, and you can flatten the combined power profile by overlapping a light-engine stage with a heavy one.
-
-I'd extend the harness with a stage_load dispatch that composes the real stage kernels (projection-matmul, M13 raster, M15 reduce, M2 scatter) with per-stage weights + soft-started transitions, so intensity ramps the heavy-stage proportion. Then one careful run gives you the per-stage power map and a PSU-safe stage schedule for the real training loop.
-
-Want me to build the stage scheduler that way — composing the actual 3DGS stage kernels with ramped transitions?
-
-Right — and the stage scheduler is what makes optimization possible, because once you can profile and reorder stages you have a constrained optimization problem with a genuinely elegant structure.
-
-Objective: maximize 3DGS training throughput (iters/sec, or Mpix/s) subject to peak power ≤ PSU-safe and |dP/dt| ≤ the VR slew limit — ideally while sitting at the VR's efficiency knee (your efficiency-vs-ICCmax point).
-
-The key insight — one move satisfies all three goals: flatten the aggregate power waveform by overlapping stages across engines. A naive per-step waveform is spiky: idle→NoC scatter→max matrix-engine projection→idle. That spikiness is bad on every axis at once:
-
-peak hits the PSU ceiling → forces you to cap overall intensity/clock (throughput ↓),
-the swings stress the VR → efficiency loss + dI/dt risk,
-engines sit idle waiting their turn → utilization ↓.
-Now software-pipeline the stages so different engines run concurrently — e.g. matrix-engine projection of step N+1 overlaps NoC scatter of step N's backward, SFPU raster overlaps a reduce. The aggregate draw becomes flat and moderate instead of peaky-and-max:
-
-flat → stays under the PSU peak while doing more total work,
-flat → VR runs at its efficient steady-state (no transient waste), and dI/dt edges vanish,
-concurrent engines → high utilization → faster steps.
-So flattening is the optimization. Throughput, PSU safety, and VR efficiency are the same objective viewed three ways.
-
-Two levers on top:
-
-DVFS / operating point. Under a fixed power ceiling, "wide-and-slow-and-flat" usually beats "narrow-and-fast-and-spiky": drop the clock to the efficiency knee (perf/W max), which frees power headroom to run more cores concurrently — net throughput up at the same watts. The optimizer should pick the (clock, core-allocation) point, not just the schedule.
-
-Host-dispatch overhead is the real ceiling. Your own M14 finding: the batched path is host-overhead-bound (per-dispatch ProgramDescriptor build in Python). You can't overlap stages if the host serializes them — so the optimizer's enabler is getting work off the host critical path: reuse program objects, async / multiple command queues, on-device binning/control, fuse adjacent stages. That also flattens power (more device-resident work = steadier draw). The two optimizations reinforce.
-
-What I'd build: extend the stage scheduler into a StageOptimizer — (1) profile each stage on-device through the ramp harness → per-stage (power, dI/dt, latency, engine, core-scaling); (2) search schedule space (order, pipeline depth/overlap, per-stage core+engine allocation, clock point, ramp rates) to maximize iters/sec s.t. peak-power + dI/dt constraints; (3) validate the winning schedule on-device behind the ramp controller's abort safety. Output = a PSU-safe, throughput-optimal, flat-power schedule for the real M16 training loop.
-
-Default objective = max throughput under the PSU envelope (with perf/W as tiebreaker). Want me to build the StageOptimizer on that objective — profile-search-validate — and keep the abort guard in the loop so a bad candidate can't reboot the box?
-
-ok, yes we need to pathclear the actual 3dgs algorithm and see it in the viewer, max perf but be careful about virus behaviors
-This is the milestone everything's been building toward — real device 3DGS, in the viewer, max perf, without tripping into virus/PSU behavior. That's large and hardware-risky enough ("be careful about virus behaviors" — agreed) that I want to nail the integration points and the safety guard before I touch train_tt or run anything heavy on-device. Let me switch to planning and map the exact wiring.
-
-EnterPlanMode
-OUT
-Entered plan mode. You should now focus on exploring the codebase and designing an implementation approach.
-
-In plan mode, you should:
-1. Thoroughly explore the codebase to understand existing patterns
-2. Identify similar features and architectural approaches
-3. Consider multiple approaches and their trade-offs
-4. Use AskUserQuestion if you need to clarify the approach
-5. Design a concrete implementation strategy
-6. When ready, use ExitPlanMode to present your plan for approval
-
-Remember: DO NOT write or edit any files yet. This is a read-only exploration and planning phase.
+**Remaining — perf/scale follow-ons, not feasibility:** full GDDR param streaming (zero host arg-pack) +
+`sgid`→DRAM (on-device sort past ~32k); a power-ramp guard wired into the resident loop (PSU dI/dt at
+full-grid 1600px — `docs/pathclear/power_ramp.py` is the harness); on-device densification toward millions;
+and an on-device sort for >1M Gaussians. The plans of record are `docs/SCALE_CAMPAIGN_PLAN.md` (full-res +
+millions) and `docs/PERF_LOCALITY_PLAN.md` (data-locality / owner-reduce).

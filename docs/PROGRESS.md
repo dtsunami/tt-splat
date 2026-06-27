@@ -5,12 +5,14 @@
 built and proven. Companion docs: [`FEASIBILITY.md`](../FEASIBILITY.md) (original analysis),
 [`ALGORITHM.md`](ALGORITHM.md) + `algorithm.svg` (annotated pipeline map), [`README.md`](../README.md).
 
-**Status (2026-06-24): every algorithmic stage of 3DGS training is proven on real Blackhole
-silicon or on the right general-purpose target. No open feasibility questions remain — what's
-left is integration + performance, not research.** The 2D training loop is closed and triple-
-verified; 3D closed with novel-view synthesis; the real-data pipeline runs on a real capture; the
-arcgs dashboard drives the TT backend; and the full device path (forward + backward + scatter-add
-+ optimizer) is validated on silicon.
+**Status (2026-06-27): the full device-resident training loop is closed and running at full resolution
+on silicon.** Every algorithmic stage (M0–M16 below) is proven; beyond them, the integrated loop
+(projection → M14 raster → fused backward → analytic projection backward → Adam) runs entirely on the
+Blackhole with params + optimizer resident (no host autograd), drives the live dashboard, and now trains at
+**1600px / 50k Gaussians (1.4k+ iterations stable)** via an on-device counting bin/sort and a tile-block
+raster. The scale-up plans of record are [`SCALE_CAMPAIGN_PLAN.md`](SCALE_CAMPAIGN_PLAN.md) (full-res +
+millions) and [`PROJECTION_FUSION_PLAN.md`](PROJECTION_FUSION_PLAN.md). No open feasibility questions
+remain — what's left is perf/scale (GDDR streaming, power-ramp guard, on-device densify, on-die sort).
 
 ---
 
@@ -108,13 +110,16 @@ hyperparam** (JIT compile ≈ 500 ms). arcgs's `update_config` maps straight ont
 novel-view synthesis, scatter-add, multi-tile rasterizer (188 Mpix/s), culling + unbounded N,
 **device backward (autograd-verified)**, COLMAP ingestion, the arcgs dashboard driving the TT backend.
 
-**The device-resident training loop is closed** (M16): forward + backward + reduction on device, Adam
-on the device-reduced grads, converging to 72 dB. **Remaining — perf/scale, not research:**
-1. Swap `ttnn.sum` → fused `reduce_tile<fp32>` for tight gradients; fuse fwd+bwd into custom SFPU kernels (perf).
-2. Wire M2 scatter-add for multi-tile / many-Gaussian gradient accumulation; fully-device packed Adam (M0).
-3. Drop behind `train_tt`'s `render_device`/`backward_device` hooks → arcgs dashboard drives
-   **Blackhole-accelerated** training end to end.
-4. Real-scene scale (DRAM-streamed Gaussians, GPU/x280 sort), RGB device path, SH on device.
+**The full device-resident loop is closed AND scaled** — project → raster → fused backward → analytic
+projection backward → Adam, all resident; it drives the dashboard and trains **1600px / 50k Gaussians
+(1.4k+ iterations stable)**. Landed since M16: the fused m17 backward, projection fusion, the on-device
+counting **bin/sort** (`server/device_binsort.py`), and the **tile-block raster** (any resolution,
+`server/raster_blocked.py`) with a vectorized arg-pack + s4 in-kernel reduce. **Remaining — perf/scale,
+not research** (plan of record: [`SCALE_CAMPAIGN_PLAN.md`](SCALE_CAMPAIGN_PLAN.md)):
+1. Full **GDDR param streaming** (zero host arg-pack) + `sgid`→DRAM (on-device sort past ~32k).
+2. **Power-ramp guard** wired into the resident loop (PSU dI/dt at full-grid 1600px — `power_ramp.py`).
+3. **On-device densification** + hash-home owner-reduce (grads resident A→D→C) toward millions.
+4. On-die counting/radix **sort** for >1M Gaussians; GDDR owner-partitioned tiering past the L1 ceiling.
 
 ---
 
