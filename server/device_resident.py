@@ -129,7 +129,7 @@ class DeviceResidentTrainer:
             # ===== A: raster backward (grid-sharded) =====
             gv, cgv = fused_backward_grid(dev, cxv, cyv, av, bv, ccv, opv, colv,
                                           tile_lists, ntx, Hp // 32, Wp, Hp, gp, Tfin,
-                                          stage=os.environ.get("TT_FB_STAGE", "s3"))   # Stage 3 default
+                                          stage=os.environ.get("TT_FB_STAGE", "s4"))   # Stage 4 default (re-fused matmul reduce; -448KB L1, faster)
             for key in _GEOM:
                 grads2d[key][vidx] = gv[key]
             for k in range(3):

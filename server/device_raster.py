@@ -135,7 +135,7 @@ class DeviceRaster(torch.autograd.Function):
             cxv, cyv, av, bv, cv, opv, colv = ctx.cxv, ctx.cyv, ctx.av, ctx.bv, ctx.cv, ctx.opv, ctx.colv
             # STAGE A: grid-sharded backward — ONE dispatch per (chunk,channel), all tiles parallel
             gv, cgv = fused_backward_grid(dev, cxv, cyv, av, bv, cv, opv, colv, tl, ntx, Hp // 32, Wp, Hp, gi, Tfin,
-                                          stage=os.environ.get("TT_FB_STAGE", "s3"))   # Stage 3 default
+                                          stage=os.environ.get("TT_FB_STAGE", "s4"))   # Stage 4 default (re-fused matmul reduce; -448KB L1, faster)
             for key in ("cx", "cy", "a", "b", "c", "op"):
                 geomg[key][vidx] = gv[key]                    # valid-subset -> original Gaussian index
             for k in range(3):
