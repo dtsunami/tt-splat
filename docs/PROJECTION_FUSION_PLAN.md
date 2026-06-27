@@ -62,8 +62,10 @@ durability win all three judges converged on.
   even with fp32 dst-accum. Moderate chains pass 1e-2 with margin; **long geometry contraction chains
   (gscale/gquat) accumulate ~sqrt(nops)·1.5e-3 of error**, so the "compute G once + keep chains short via
   group-split" rule is a PRECISION safeguard, not just perf. Add a per-group readback micro-gate to catch drift.
-- **Step 1 — backend refactor, byte-identical (~2 days).** Land `backend.py` (TtnnBackend default), thread `B`.
-  Gate: test_proj + test_proj_bwd pass **byte-identically** (pure refactor).
+- **Step 1 — backend refactor, byte-identical — DONE ✅ (`675fec1`).** Landed `server/backend.py`
+  (Backend ABC + TtnnBackend default); threaded `backend=None` through project_geom/color/op/backward; the
+  m/ad/neg/s1 aliases are backend-local (`_aliases(B)`); helpers take `B`; structural ops stay ttnn. Gate:
+  test_proj 1.14e-6, test_proj_bwd all OK (7.64e-7) — **byte-identical**; resident loop RESIDENT_TRAIN_TT_OK.
 - **Step 2 — SHIP THE EASY HALF (~3 days, FIRST REAL WIN).** TraceBackend + NumpyBackend + tilealloc on the
   **SH/color backward group** (gsh/gdir/gmean_color/gop — 18.4 ms, pure muls, bf16, fits 16 regs, ~0 recompute).
   Host gates first (NumpyBackend==ttnn, reg-sim==NumpyBackend — zero hardware), then silicon. Gate: color-half
