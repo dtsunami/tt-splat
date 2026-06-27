@@ -349,6 +349,9 @@ def blackhole(
                                        help="Render the dashboard frame ON the Blackhole (M14 device rasterizer)"),
     device_train: bool = typer.Option(False, "--device-train",
                                       help="Run training fwd+bwd GRADIENTS on the Blackhole (Phase 2a, small scale)"),
+    device_resident: bool = typer.Option(False, "--device-resident",
+                                         help="FULL device-resident loop: B/raster/A/D/C + Adam on the Blackhole, "
+                                              "params resident; streams per-stage telemetry to /training"),
 ) -> None:
     """[bold]Train on Tenstorrent Blackhole[/] — the ttgs dashboard driving the TT pipeline.
 
@@ -380,7 +383,10 @@ def blackhole(
         env["TT_DEVICE_RENDER"] = "1"        # train_tt renders the dashboard frame on-device
     if device_train:
         env["TT_DEVICE_TRAIN"] = "1"         # train_tt runs fwd+bwd gradients on-device (small scale)
-    tag = "  (device train)" if device_train else ("  (device render)" if device_render else "")
+    if device_resident:
+        env["TT_DEVICE_RESIDENT"] = "1"      # full device-resident loop + per-stage telemetry
+    tag = ("  (device resident)" if device_resident else "  (device train)" if device_train
+           else "  (device render)" if device_render else "")
     console.print(f"[dim]→ {' '.join(cmd)}{tag}[/]")
     raise typer.Exit(subprocess.call(cmd, env=env))
 

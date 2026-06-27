@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How tt-splat trains, for humans — the 5-stage pipeline</title>
+<style>
+  :root { --bg:#0e1116; --panel:#161b22; --ink:#e6edf3; --dim:#9aa7b4; --line:#2a3340;
+          --B:#4af; --raster:#4f8; --A:#f84; --D:#a6f; --C:#0cf; --host:#556; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.55 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:20px 24px 8px; }
+  h1 { margin:0 0 6px; font-size:23px; }
+  .sub { color:var(--dim); max-width:980px; }
+  .sub b { color:var(--ink); }
+  canvas { background:#0a0d12; border:1px solid var(--line); border-radius:12px; display:block; max-width:100%; }
+  .flowwrap { padding:14px 24px 6px; }
+  .cards { display:flex; gap:14px; flex-wrap:wrap; padding:12px 24px 28px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-left-width:5px; border-radius:11px;
+          padding:14px 16px; width:300px; scroll-margin-top:14px; }
+  .card h2 { margin:0 0 4px; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .card .tag { font-size:11px; color:var(--dim); border:1px solid var(--line); border-radius:10px; padding:1px 8px; margin-left:auto; }
+  .card .what { color:var(--ink); margin:8px 0 6px; }
+  .card .analogy { color:var(--dim); font-size:13.5px; }
+  .card .analogy b { color:var(--ink); }
+  .card .where { margin-top:9px; font-size:12px; color:var(--dim); }
+  .dot { width:11px; height:11px; border-radius:3px; display:inline-block; }
+  .phase { font-size:11px; text-transform:uppercase; letter-spacing:.09em; color:var(--dim);
+           width:100%; margin:6px 24px -2px; }
+  .legend { color:var(--dim); font-size:13.5px; padding:4px 24px 26px; max-width:1000px; }
+  .legend b { color:var(--ink); }
+  .legend code { background:#0a0d12; padding:1px 6px; border-radius:5px; color:#cde8ff; }
+  a.back { color:var(--B); text-decoration:none; font-size:13px; }
+  a.back:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>How tt-splat trains, for humans 🎢</h1>
+  <div class="sub">We're teaching a cloud of fuzzy 3D blobs (<b>Gaussians</b>) to look like a real photo. Each
+  training step does a <b>round trip</b>: paint a guess (<span style="color:var(--raster)">forward</span>), see how wrong it is,
+  then push every blob a little less wrong (<span style="color:var(--A)">backward</span>). Five stages do this, and
+  <b>all five run on the Blackhole</b> — the blobs and the optimizer never leave the card. The colored bar on the
+  training page is these exact five. Click a stage below to jump to it.</div>
+</header>
+
+<div class="flowwrap">
+  <canvas id="cv" width="980" height="150"></canvas>
+</div>
+
+<div class="cards">
+  <div class="phase">▶ Forward — paint a guess</div>
+
+  <div class="card" id="B" style="border-left-color:var(--B)">
+    <h2><span class="dot" style="background:var(--B)"></span> B · project forward <span class="tag">device</span></h2>
+    <div class="what">Turn each 3D blob into a 2D ellipse on the camera's screen: where it lands, how stretched it is, its color and opacity.</div>
+    <div class="analogy">Like a <b>slide projector</b> — a 3D thing on the carousel becomes a flat shape on the wall. We do the camera math (and spherical-harmonic color) for every blob at once.</div>
+    <div class="where">runs on device · reads the resident params</div>
+  </div>
+
+  <div class="card" id="raster" style="border-left-color:var(--raster)">
+    <h2><span class="dot" style="background:var(--raster)"></span> raster · blend <span class="tag">device</span></h2>
+    <div class="what">Walk the ellipses front-to-back and blend their colors into pixels until the view is opaque. This is the actual rendered image.</div>
+    <div class="analogy">Like stacking <b>colored glass</b>: each blob tints what's behind it a little, and once it's solid you stop. The <span style="color:var(--raster)">R/G/B channels run side-by-side</span> on three bands of cores.</div>
+    <div class="where">runs on device (M14) · outputs image + transmittance</div>
+  </div>
+
+  <div class="phase">◀ Backward — learn from the mistake</div>
+
+  <div class="card" id="A" style="border-left-color:var(--A)">
+    <h2><span class="dot" style="background:var(--A)"></span> A · raster backward <span class="tag">device · biggest</span></h2>
+    <div class="what">Given "the painting is wrong here," figure out how much each blob's 2D ellipse is to blame — the gradient of the blend.</div>
+    <div class="analogy">Replay the glass-stacking <b>in reverse</b>, asking each pane "if you'd been a bit different, would the picture be closer?" It's the heaviest stage, so it's where we fight hardest for speed.</div>
+    <div class="where">runs on device · the current bottleneck</div>
+  </div>
+
+  <div class="card" id="D" style="border-left-color:var(--D)">
+    <h2><span class="dot" style="background:var(--D)"></span> D · project backward <span class="tag">device</span></h2>
+    <div class="what">Carry the 2D blame back through the camera math into the real 3D knobs: position, scale, rotation, color, opacity.</div>
+    <div class="analogy">Run the <b>slide projector backward</b> — "to fix the shape on the wall, nudge the 3D thing this way." These 3×3 camera matrices are the next stage we're moving onto the idle matrix engine.</div>
+    <div class="where">runs on device · reuses B's saved work</div>
+  </div>
+
+  <div class="card" id="C" style="border-left-color:var(--C)">
+    <h2><span class="dot" style="background:var(--C)"></span> C · Adam <span class="tag">device · tiny</span></h2>
+    <div class="what">Actually nudge every blob's knobs using the gradients — with momentum and per-knob caution so it converges fast and smooth.</div>
+    <div class="analogy">The <b>smart coach</b>: remembers which way things have been improving and how jittery each knob is, then takes a confident step.
+      <a class="back" href="/docs/adam_cartoon.html" target="_blank">→ full Adam cartoon</a></div>
+    <div class="where">runs on device · params + momentum stay resident</div>
+  </div>
+</div>
+
+<div class="legend">
+  The grey <b>host</b> sliver on the bar is glue that still runs on the CPU — binning/sorting the blobs into screen
+  tiles, and computing the pixel error. Everything colored is on the Blackhole. <b>A</b> (raster backward) is the
+  tallest bar, so it's the bottleneck; we just made <b>raster</b> and <b>A</b> ~1.7–1.9× faster by running
+  <span style="color:var(--raster)">R/G/B in parallel</span> on separate core-bands, and <b>D</b> (projection) is
+  next — those <code>3×3</code> matrices are literally matrix-multiplies for the idle matrix engine.
+  Watch the bar: every time we speed up the tallest stage, a different one becomes the tallest.
+</div>
+
+<script>
+// A little packet rides forward (B→raster), then a gradient packet rides backward (A→D→C), looping.
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height, midY = 64;
+const NODES = [
+  {k:'B',      x:90,  c:'#4af'},
+  {k:'raster', x:290, c:'#4f8'},
+  {k:'A',      x:490, c:'#f84'},
+  {k:'D',      x:690, c:'#a6f'},
+  {k:'C',      x:890, c:'#0cf'},
+];
+const LABEL = {B:'B · project', raster:'raster · blend', A:'A · raster bwd', D:'D · project bwd', C:'C · Adam'};
+let t = 0;
+function lerp(a,b,u){ return a+(b-a)*u; }
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  // baseline track
+  ctx.strokeStyle = '#1d2530'; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(NODES[0].x, midY); ctx.lineTo(NODES[4].x, midY); ctx.stroke();
+  // nodes
+  for (const n of NODES){
+    ctx.fillStyle = n.c; ctx.globalAlpha = 1;
+    ctx.beginPath(); ctx.arc(n.x, midY, 13, 0, 7); ctx.fill();
+    ctx.fillStyle = '#0a0d12'; ctx.font = 'bold 13px monospace'; ctx.textAlign='center';
+    ctx.fillText(n.k==='raster'?'R':n.k, n.x, midY+4);
+    ctx.fillStyle = '#9aa7b4'; ctx.font = '11px sans-serif';
+    ctx.fillText(LABEL[n.k], n.x, midY+34);
+  }
+  // forward phase (u in 0..1): green packet B->raster->A
+  // backward phase (u in 1..2): orange packet A->D->C
+  const u = (t % 2);
+  let px, py, col, txt;
+  if (u < 1){ // forward across nodes 0->2
+    const seg = u*2; const i = Math.min(Math.floor(seg),1);
+    px = lerp(NODES[i].x, NODES[i+1].x, seg-i); col = '#4f8'; txt='paint ▶';
+  } else { // backward across nodes 2->4
+    const seg = (u-1)*2; const i = Math.min(Math.floor(seg),1);
+    px = lerp(NODES[2+i].x, NODES[2+i+1].x, seg-i); col = '#f84'; txt='◀ learn';
+  }
+  py = midY - 30;
+  ctx.fillStyle = col; ctx.globalAlpha = 1;
+  ctx.beginPath(); ctx.arc(px, py, 7, 0, 7); ctx.fill();
+  ctx.font = 'bold 12px sans-serif'; ctx.textAlign='center'; ctx.fillText(txt, px, py-12);
+  // phase caption
+  ctx.fillStyle = '#9aa7b4'; ctx.font = '12px sans-serif'; ctx.textAlign='left';
+  ctx.fillText(u<1 ? 'forward: blobs → image' : 'backward: error → nudges', 16, H-14);
+  t += 0.010;
+  requestAnimationFrame(draw);
+}
+draw();
+</script>
+</body>
+</html>

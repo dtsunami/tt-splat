@@ -28,6 +28,7 @@ HOST_MAX_POINTS = int(os.environ.get("TT_MAX_POINTS", "1200"))   # host-render b
 HOST_SIZE = int(os.environ.get("TT_SIZE", "96"))
 USE_DEVICE_RENDER = int(os.environ.get("TT_DEVICE_RENDER", "0"))  # render dashboard frame ON the Blackhole (M14)
 USE_DEVICE_TRAIN = int(os.environ.get("TT_DEVICE_TRAIN", "0"))    # fwd+bwd GRADIENTS on the Blackhole (Phase 2a)
+USE_DEVICE_RESIDENT = int(os.environ.get("TT_DEVICE_RESIDENT", "0"))  # FULL device-resident loop (B/raster/A/D/C + Adam on-device)
 _render_device = None                                             # lazy: imports ttnn only when enabled
 _render_train = None
 
@@ -155,6 +156,54 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
 
     total = int(getattr(cfg, "iterations", 1000))
     focus = None; ply = output_dir / "splat.ply"
+
+    if USE_DEVICE_RESIDENT:    # full device-resident loop: B/raster/A/D/C + Adam on the Blackhole, per-stage telemetry
+        from render_device import _device
+        from device_resident import DeviceResidentTrainer
+        dev = _device()
+        trainer = DeviceResidentTrainer(dev, P, lr=lr, deg=int(getattr(cfg, "sh_degree", 3)))
+        ngauss = P["mean"].shape[0]
+        print(f"device RESIDENT train: ON — B/raster/A/D/C + Adam on the Blackhole, params resident "
+              f"({ngauss} Gaussians @ {HOST_SIZE}px); per-stage timings stream to the dashboard")
+        every = max(1, getattr(cfg, "dashboard_every", 25))
+        for step in range(1, total + 1):
+            if dashboard is not None:
+                if dashboard.should_stop: break
+                dashboard.wait_if_paused()
+                for cmd in dashboard.drain_commands():
+                    t = cmd.get("type")
+                    if t == "focus_camera":
+                        focus = cmd.get("camera_name")
+                    elif t == "save":
+                        _write_ply(ply, trainer.params_host())
+                    elif t == "update_config" and "iterations" in cmd:
+                        total = int(cmd["iterations"])
+                    elif t in ("prune", "reset_opacities", "clamp_scale", "set_lr"):
+                        print(f"  [resident] command '{t}' not supported in device-resident mode (skipped)")
+                    dashboard.log_command(t, step, "", {"n_gaussians": ngauss})
+
+            vi = (step - 1) % len(views)
+            if focus is not None:
+                cand = [i for i, v in enumerate(views) if v[6] == focus]; vi = cand[0] if cand else vi
+            cam, gt, pm = views[vi], targets[vi], masks[vi]
+            mask = (pm.detach().cpu().numpy() if torch.is_tensor(pm) else np.asarray(pm)) if pm is not None else None
+            gmask = dashboard.get_mask() if dashboard is not None else None
+            if gmask is not None and np.asarray(gmask).shape[:2] == (H, W):
+                gm = np.asarray(gmask, np.float64); mask = gm if mask is None else mask * gm
+            loss, img = trainer.step(cam, gt, mask)       # all param math on device; (loss, np[H,W,3])
+
+            if dashboard is not None and (step == 1 or step % every == 0):
+                g = (gt.detach().cpu().numpy() if torch.is_tensor(gt) else np.asarray(gt)).astype(np.float32)
+                g = np.clip(g, 0, 1); r = np.clip(img, 0, 1)
+                dashboard.push_update(build_update(
+                    step=step, total_steps=total, loss=loss, n_gaussians=ngauss,
+                    camera_name=cam[6], render=r, gt=g, is_paused=dashboard.is_paused,
+                    focus_camera=focus, l1=float(abs(r - g).mean()), mse=loss,
+                    ssim=psnr(torch.tensor(r), torch.tensor(g)), stage_timings=trainer.step_log[-1]))
+        _write_ply(ply, trainer.params_host())
+        print(f"device RESIDENT train done — {trainer.report()}")
+        return ply
+
     for step in range(1, total + 1):
         if dashboard is not None:
             if dashboard.should_stop: break

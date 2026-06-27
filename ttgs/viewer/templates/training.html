@@ -78,6 +78,36 @@
       letter-spacing: .5px;
     }
 
+    /* ── pipeline stage breakdown ── */
+    #stage-panel {
+      display: none; flex-shrink: 0; background: #0e0e0e;
+      border-top: 1px solid #2a2a2a; padding: 8px 16px;
+    }
+    #stage-panel.visible { display: block; }
+    .stage-head {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 11px; color: #888; margin-bottom: 6px;
+    }
+    .stage-head .sp-title { color: #ccc; font-weight: bold; font-size: 12px; }
+    .stage-head a { color: #4af; text-decoration: none; }
+    .stage-head a:hover { text-decoration: underline; }
+    .stage-bar {
+      display: flex; height: 18px; border-radius: 3px;
+      overflow: hidden; background: #1a1a1a;
+    }
+    .stage-seg { height: 100%; min-width: 0; transition: width .25s ease; }
+    .stage-legend {
+      display: flex; flex-wrap: wrap; gap: 6px 14px;
+      margin-top: 7px; font-size: 11px;
+    }
+    .stage-chip {
+      display: flex; align-items: center; gap: 5px;
+      color: #aaa; cursor: pointer; text-decoration: none;
+    }
+    .stage-chip:hover { color: #fff; }
+    .stage-dot { width: 9px; height: 9px; border-radius: 2px; flex-shrink: 0; }
+    .stage-chip b { color: #fff; font-family: monospace; }
+
     /* ── stats bar ── */
     #stats-bar {
       display: flex; align-items: center; gap: 18px;
@@ -155,6 +185,19 @@
       <span id="st-mask-status" style="color:#555">--</span>
     </div>
 
+    <!-- pipeline stage breakdown (device-resident training only) -->
+    <div id="stage-panel">
+      <div class="stage-head">
+        <span class="sp-title">Pipeline stages</span>
+        <span class="muted small">per-step time on the Blackhole</span>
+        <span class="spacer"></span>
+        <span>step <b id="sp-step" style="color:#fff;font-family:monospace">--</b> ms</span>
+        <a href="/docs/pipeline_cartoon.html" target="_blank">&#9432; how training works</a>
+      </div>
+      <div class="stage-bar" id="stage-bar"></div>
+      <div class="stage-legend" id="stage-legend"></div>
+    </div>
+
     <!-- loss chart -->
     <div id="chart-area">
       <div class="chart-header"><b>Loss</b> L1 / SSIM / MSE</div>
@@ -208,6 +251,37 @@
 const ps = document.getElementById('poll-status');
 let _chartTick = 0;
 let _currentCam = null;
+
+// ── Pipeline stage breakdown (B/raster/A/D/C) ───────────────────────────────
+// Each chip links to a plain-language "cartoon" explainer of that stage.
+const STAGES = [
+  {k:'B',      label:'B · project fwd', color:'#4af', doc:'pipeline_cartoon.html#B'},
+  {k:'raster', label:'raster · blend',  color:'#4f8', doc:'pipeline_cartoon.html#raster'},
+  {k:'A',      label:'A · raster bwd',  color:'#f84', doc:'pipeline_cartoon.html#A'},
+  {k:'D',      label:'D · project bwd', color:'#a6f', doc:'pipeline_cartoon.html#D'},
+  {k:'C',      label:'C · Adam',        color:'#0cf', doc:'adam_cartoon.html'},
+];
+
+function updateStages(t) {
+  const panel = document.getElementById('stage-panel');
+  if (!t) { panel.classList.remove('visible'); return; }
+  panel.classList.add('visible');
+  const step = t.step || 0;
+  document.getElementById('sp-step').textContent = step.toFixed(1);
+  const denom = Math.max(step, 1e-6);
+  let segs = '', chips = '';
+  for (const s of STAGES) {
+    const ms = t[s.k] || 0, pct = 100 * ms / denom;
+    segs += `<div class="stage-seg" style="width:${pct}%;background:${s.color}" title="${s.label}: ${ms.toFixed(1)} ms"></div>`;
+    chips += `<a class="stage-chip" href="/docs/${s.doc}" target="_blank" title="explain ${s.label}">`
+           + `<span class="stage-dot" style="background:${s.color}"></span>${s.label} <b>${ms.toFixed(1)}</b></a>`;
+  }
+  const host = (t.bin || 0) + (t.loss || 0);   // host glue: bin/sort + loss (not on device)
+  segs += `<div class="stage-seg" style="width:${100*host/denom}%;background:#444" title="host glue (bin/sort + loss): ${host.toFixed(1)} ms"></div>`;
+  chips += `<span class="stage-chip" style="cursor:default"><span class="stage-dot" style="background:#444"></span>host <b>${host.toFixed(1)}</b></span>`;
+  document.getElementById('stage-bar').innerHTML = segs;
+  document.getElementById('stage-legend').innerHTML = chips;
+}
 
 // Init shared components
 try {
@@ -270,6 +344,9 @@ async function tick() {
       document.getElementById('st-ssim').textContent = d.ssim.toFixed(4);
       document.getElementById('st-mse').textContent = d.mse.toFixed(5);
       document.getElementById('st-n').textContent = d.n_gaussians.toLocaleString();
+
+      // Pipeline stage breakdown (only present in device-resident training)
+      updateStages(d.stage_timings);
 
       // Load mask overlay when camera changes
       if (d.camera_name !== _currentCam) {

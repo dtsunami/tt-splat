@@ -233,8 +233,9 @@ def build_update(
     l1: float = 0.0,
     ssim: float = 0.0,
     mse: float = 0.0,
+    stage_timings: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    return {
+    update = {
         "step":         step,
         "total_steps":  total_steps,
         "loss":         round(float(loss), 6),
@@ -249,6 +250,9 @@ def build_update(
         "gt_b64":       _to_b64(gt),
         "diff_b64":     _lum_diff_b64(render, gt),
     }
+    if stage_timings is not None:    # device-resident per-stage wall (ms): B/bin/raster/loss/A/D/C/step
+        update["stage_timings"] = {k: round(float(v), 2) for k, v in stage_timings.items()}
+    return update
 
 
 # ─── Pydantic models ──────────────────────────────────────────────────────────
@@ -391,6 +395,17 @@ def build_app(pipeline):
     async def image_edit_page(name: str):
         html = _tpl.joinpath("image_edit.html").read_text(encoding="utf-8")
         return HTMLResponse(html.replace("__IMAGE_NAME__", name))
+
+    @app.get("/docs/{name}", response_class=HTMLResponse)
+    async def docs_cartoon(name: str):
+        """Serve the human-friendly HTML 'cartoon' explainers from the repo docs/ dir
+        (adam_cartoon.html, pipeline_cartoon.html). Restricted to .html basenames in docs/."""
+        if not name.endswith(".html") or "/" in name or ".." in name:
+            return Response(status_code=404)
+        path = Path(__file__).resolve().parents[2] / "docs" / name
+        if not path.is_file():
+            return Response(status_code=404)
+        return HTMLResponse(path.read_text(encoding="utf-8"))
 
     @app.get("/static/{filename}")
     async def static_file(filename: str):
