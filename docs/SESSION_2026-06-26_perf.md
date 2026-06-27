@@ -114,6 +114,26 @@ per tile so raster/A are cheap and the per-Gaussian **projection (B+D)** is the 
 (projection-as-matmul) is decisively the next target** on real data; re-profile per-scene (the bottleneck is
 data-dependent, not just stage-dependent).
 
+## Step 3 (projection-as-matmul) — triage + mechanism de-risk (in progress)
+
+Profiled B+D at training scale (N=800): **57.5ms is 100% ttnn dispatch overhead** (~570 tiny elementwise
+ops × ~0.11ms each; readback 0.2ms = non-issue). So ttnn IS the wall; the only lever is killing dispatch
+count. The math is per-Gaussian-varying (R from quat, J from mean) → `ttnn.matmul` doesn't map cleanly →
+the real fix is a fused custom kernel (1024 Gaussians/tile in SFPU lanes, ~570 dispatches → ~2).
+
+**Mechanism de-risked on silicon (`scratchpad/proto_tilevm.py`):**
+- ❌ generic tile-VM with an L1 register-file (pack→POOL slot→`copy_tile` back) **FAILS** — packer→unpacker
+  sync hazard when you bypass the CB FIFO handshake with explicit indices (round-trip returned rel ~1.0).
+- ✅ **dst-resident** (the m17 shape): read-only input CB + working set in dst regs + pack only outputs.
+  `a*b+a` correct to bf16 (1.5e-2). fp32 (needed for signed grads) → `fp32_dest_acc_en` halves dst 16→8.
+- ⇒ the fused backward must be a **hand-structured / code-generated dst-resident fp32 kernel** with
+  recompute-based ≤8-reg allocation (no cheap spill). A multi-part kernel build, not a wire-in.
+
+**D (37.8ms) splits — chose D-first:** geometry contractions (deg=0) = 19.9ms (hard: G/GR/gscale/gqn,
+thousands of ops, needs codegen); **SH/color backward = 18.4ms (easy: pure muls/adds — gsh/gdir/gmean_color,
+fits the dst-resident pattern).** → **first kernel = SH/color backward** (half of D, tractable, clean
+test_proj_bwd gate), geometry follows. Groundwork committed `proto_tilevm.py` + `prof_projection.py`.
+
 ## How to resume
 - Train with Stage 3: `TT_DEVICE_RESIDENT=1 ttgs blackhole work/scene` (default `TT_FB_STAGE=s3`;
   `=base` to A/B). Gate: `scratchpad/test_grid.py` (set `FB_S2`/`FB_S3`), perf: `scratchpad/bench_S2.py`,
