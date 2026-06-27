@@ -96,6 +96,24 @@ late: B=14.8 · raster=20.3 · A=34.0 · D=25.1 · C=3.0
 
 → **Next: projection-as-matmul (#3)** hits B+D (40 ms / 41%); A's matmul re-fusion (#4) is the other lever.
 
+## Webapp live telemetry — SHIPPED (`0251ee3`)
+
+Wired `DeviceResidentTrainer` into `train_tt.run` as the **`TT_DEVICE_RESIDENT`** backend (CLI:
+`ttgs blackhole work/scene --device-resident`) — B/raster/A/D/C + Adam all on-device, params resident.
+Per-step stage timings stream to the dashboard: `build_update()` gained `stage_timings` → `/state` +
+history; `/training` shows a **"Pipeline stages" panel** (stacked B/raster/A/D/C bar + per-stage ms chips,
+each linking to a cartoon; host glue = bin+loss shown grey). New `docs/pipeline_cartoon.html` (forward/
+backward round-trip explainer, animated flow) served via new `GET /docs/{name}` route; Stage-C chip →
+existing `adam_cartoon.html`. Verified: web layer via FastAPI TestClient; device-resident loop on silicon
+writes `splat.ply` + streams telemetry. Gates: `scratchpad/test_webapp_telemetry.py`, `test_resident_train_tt.py`.
+
+**REAL-SCENE PROFILE FLIP (important):** on `work/scene` (800 sparse Gaussians, real corgi) the steady step is
+**B=22.6 raster=5.8 A=10.6 D=45.8 C=3.0 ms — D (projection) DOMINATES**, not A. The synthetic N=1024 profile
+(A largest) was an artifact of dense uniform clustering; on real sparse COLMAP points there are few Gaussians
+per tile so raster/A are cheap and the per-Gaussian **projection (B+D)** is the wall. → **Step #3
+(projection-as-matmul) is decisively the next target** on real data; re-profile per-scene (the bottleneck is
+data-dependent, not just stage-dependent).
+
 ## How to resume
 - Train with Stage 3: `TT_DEVICE_RESIDENT=1 ttgs blackhole work/scene` (default `TT_FB_STAGE=s3`;
   `=base` to A/B). Gate: `scratchpad/test_grid.py` (set `FB_S2`/`FB_S3`), perf: `scratchpad/bench_S2.py`,
