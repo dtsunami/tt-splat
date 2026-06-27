@@ -77,6 +77,44 @@ def _basis_deriv(B, x, y, z, deg):
     return out
 
 
+def _color_op_backward(B, shcol, up, AC, op_sig, deg):
+    """Opacity + SH-color backward — the 'easy half' of Stage D (pure muls/adds + the >0/<1 cmask, NO
+    transcendentals/reciprocals). One source for all three backends: ttnn (TtnnBackend), the fp64 oracle
+    (NumpyBackend), or the DAG recorder (TraceBackend -> tile-compiler). Operands are backend values.
+      shcol(k,c) -> sh[k,c];  up{op,colR,colG,colB};  AC{pre[3], wb[1..K-1], x,y,z, inv};
+      op_sig = sigmoid(op_logit).   Returns (gop, gsh_t{(k,c)->[N]}, gmean_color[3])."""
+    m, ad, neg, s1 = _aliases(B)
+    K = (deg + 1) ** 2
+    # (1) opacity:  gop = up_op * sigmoid * (1 - sigmoid)
+    gop = m(m(up["op"], op_sig), ad(neg(op_sig), 1.0))
+    # (2) SH:  gpre_c = up_col_c * (0 < pre_c < 1);  gsh[k,c] = gpre_c * wb_k  (wb_0 = C0)
+    cmask = [m(B.gt(AC["pre"][c], 0.0), B.lt(AC["pre"][c], 1.0)) for c in range(3)]
+    gpre = [m(up[f"col{ch}"], cmask[i]) for i, ch in enumerate("RGB")]
+    gsh_t = {}
+    for c in range(3):
+        gsh_t[(0, c)] = s1(gpre[c], _C0)
+        for k in range(1, K):
+            gsh_t[(k, c)] = m(gpre[c], AC["wb"][k])
+    # color -> dirs -> mean:  gdir_d = sum_c gpre_c * sum_k sh[k,c]*dB[k,d];  then project off the view dir
+    db = _basis_deriv(B, AC["x"], AC["y"], AC["z"], deg)
+    Z = B.mul(AC["x"], 0.0)
+    gdir = [B.add(Z, 0.0) for _ in range(3)]
+    for c in range(3):
+        sc = [B.add(Z, 0.0) for _ in range(3)]            # sum_k sh[k,c]*dB[k,d]
+        for k in range(1, K):
+            shkc = shcol(k, c)
+            for d in range(3):
+                sc[d] = ad(sc[d], m(shkc, db[k][d]))
+        for d in range(3):
+            gdir[d] = ad(gdir[d], m(gpre[c], sc[d]))
+    dirs = [AC["x"], AC["y"], AC["z"]]; inv = AC["inv"]
+    gdot = None
+    for d in range(3):
+        t = m(gdir[d], dirs[d]); gdot = t if gdot is None else ad(gdot, t)
+    gmean_color = [m(B.sub(gdir[d], m(gdot, dirs[d])), inv) for d in range(3)]
+    return gop, gsh_t, gmean_color
+
+
 def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None):
     """P: dict with mean,scale,quat,op,sh (host torch OR device-resident ttnn), deg.
     cam: (Rv,tv,fx,fy,cx,cy).  up: dict of upstream grads u,v,ca,cb,cc,op,colR,colG,colB (host torch [N]).
@@ -97,34 +135,10 @@ def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None)
         A, AC = aux
     U = {k: (up[k] if isinstance(up[k], ttnn.Tensor) else _t2t(dev, up[k])) for k in up}
 
-    # ===== (1) opacity =====
-    op = project_op(dev, P["op"], backend=backend)
-    gop = m(m(U["op"], op), ad(neg(op), 1.0))
-
-    # ===== (2) SH color: gpre_c = up_col_c * cmask_c =====
-    cmask = []
-    for c in range(3):
-        pr = AC["pre"][c]
-        cmask.append(m(B.gt(pr, 0.0), B.lt(pr, 1.0)))
-    gpre = [m(U[f"col{ch}"], cmask[i]) for i, ch in enumerate("RGB")]
-    # sh grad: gsh[k,c] = gpre_c * wb_k   (wb_0 = C0)
-    gsh_t = {}                                            # (k,c) -> [N] ttnn
-    for c in range(3):
-        gsh_t[(0, c)] = s1(gpre[c], _C0)
-        for k in range(1, K):
-            gsh_t[(k, c)] = m(gpre[c], AC["wb"][k])
-    # color -> dirs:  gdirs_d = sum_c gpre_c * sum_k sh[k,c]*dB[k,d]
-    db = _basis_deriv(B, AC["x"], AC["y"], AC["z"], deg)
-    Z = B.mul(AC["x"], 0.0)
-    gdir = [B.add(Z, 0.0) for _ in range(3)]
-    for c in range(3):
-        sc = [B.add(Z, 0.0) for _ in range(3)]            # sum_k sh[k,c]*dB[k,d]
-        for k in range(1, K):
-            shkc = _shcol(dev, sh, k, c)
-            for dmn in range(3):
-                sc[dmn] = ad(sc[dmn], m(shkc, db[k][dmn]))
-        for dmn in range(3):
-            gdir[dmn] = ad(gdir[dmn], m(gpre[c], sc[dmn]))
+    # ===== (1)+(2) opacity + SH-color backward (extracted -> one source for ttnn/numpy/trace; fusable) =====
+    op_sig = project_op(dev, P["op"], backend=backend)
+    gop, gsh_t, gmean_color = _color_op_backward(
+        B, lambda k, c: _shcol(dev, sh, k, c), U, AC, op_sig, deg)
 
     # ===== (3) conic -> Sig2 (a_,b_,c_) =====
     a_, b_, c_, di = A["a_"], A["b_"], A["c_"], A["di"]
@@ -241,18 +255,8 @@ def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None)
         proj = B.sub(gqn[mq], m(dot, qnc[mq]))
         gquat_t.append(m(proj, qninv))
 
-    # ===== mean total = geom + color(dirs) =====
-    # ddir/dmean = (I - dirs dirs^T)/|d| ;  inv = 1/|d|
-    x, y, z, inv = AC["x"], AC["y"], AC["z"], AC["inv"]
-    dirs = [x, y, z]
-    gdot = None
-    for dmn in range(3):
-        t = m(gdir[dmn], dirs[dmn])
-        gdot = t if gdot is None else ad(gdot, t)
-    gmean_t = []
-    for dmn in range(3):
-        gmc_col = m(B.sub(gdir[dmn], m(gdot, dirs[dmn])), inv)
-        gmean_t.append(ad(gmean_geom[dmn], gmc_col))
+    # ===== mean total = geometry grad + color(dirs) grad (color part from _color_op_backward) =====
+    gmean_t = [ad(gmean_geom[dmn], gmean_color[dmn]) for dmn in range(3)]
 
     if return_ttnn:                                       # DEVICE-RESIDENT grads -> device Adam, no round-trip
         return dict(
