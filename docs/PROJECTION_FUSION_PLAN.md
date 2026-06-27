@@ -77,8 +77,12 @@ durability win all three judges converged on.
   41× faster.** fp32-8 used (color group has the gmean_color subtraction → fp32, not bf16). KEY learning: pure
   recompute makes one 150KB kernel that won't JIT-compile → `partition()` group-split (4 kernels: gop+gsh + 3×
   gmean_color) is the fix; a sharing/recompute allocator would cut the 4739 instrs further (gdir recompute) —
-  follow-on. **REMAINING for the live win:** on-device input assembly (avoid the host round-trip that
-  `run_color_fused` currently does) + wire behind a flag in `project_backward` + D-stage telemetry.
+  follow-on. **WIRED LIVE ✅:** `color_backward_fused` (drop-in for `_color_op_backward`) swapped in
+  `project_backward` behind `TT_PROJ_FUSED=1`; robust to ttnn/torch/numpy params. Integrated backward vs
+  torch (flag on): all OK (op 3.9e-4, sh 7.6e-4, mean 9.6e-6). **Resident loop (work/scene, 800 Gaussians):
+  D 44.5→29.6 ms, step 86.0→72.4 ms, loss converges.** Run it: `TT_PROJ_FUSED=1 ttgs blackhole work/scene
+  --device-resident` → the dashboard D-stage shrinks. Host-assembled I/O (~5 ms color vs ttnn 18.9 ms);
+  the dispatch-only ceiling is 0.46 ms (41×), unlocked by the on-device input-assembly follow-on.
 - **Step 3 — geometry conic/mean chain (~3 days).** fp32-8, moderate recompute. Gate: those columns rel<1e-2.
 - **Step 4 — hard contractions gscale/gquat (~1 week).** Compute shared `G = Rvᵀ gSC Rv` once, share via the
   proven FIFO output-CB (9–18 tiles co-live → G-share is mandatory, not optional). Gate: scale/quat rel<1e-2;
