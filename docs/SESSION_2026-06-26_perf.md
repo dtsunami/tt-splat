@@ -63,6 +63,39 @@ its Amdahl share. The long-horizon wall is the **host-serial fraction** (bin/sor
   physical-core table (router-gap columns; `compute_with_storage_grid_size`), not the descriptor template.
 - **A killed/hung kernel wedges the card** → `tt-smi -r 0`. Reader CB balance (S/T recurrence) must be exact.
 
+## Channel parallelism — SHIPPED (step #1, both halves)
+
+R/G/B were 3 *serial* passes on 9 cores; now stacked onto 3 vertical core-bands (logical
+`y = band*GY + gy`) → one dispatch set over ~27 cores. Geometry (cx,cy,a,b,c,op) is channel-invariant;
+only `dLdC`+`col` (bwd) / `col` (fwd) differ per band. Gated `FB_CHANPAR` / `RAST_CHANPAR` (default on),
+both with a `compute_with_storage_grid_size` fit guard + serial fallback (`NBND=1`).
+
+| commit | what | result |
+|---|---|---|
+| `69b85c9` | backward: `fused_backward_grid` 3 bands, drain 3→1, dispatch /3 | A 63.6→34.1 ms (**1.88×**) |
+| `267f01a` | forward: `_raster_rgb` 3 bands **+ geometry arg-precompute** | raster 34.3→20.3 ms (**1.69×**) |
+
+**Whole step 141.2 → 97.9 ms (1.44×)**, live loop, 96px/N=1024. Both bit-exact to serial:
+backward grads identical (S3 8.91e-04 both paths), forward pixels+T **0.000e+00**. Loss converges.
+Gates: `scratchpad/test_grid.py` (bwd), `scratchpad/test_raster_chanpar.py` (fwd, new).
+
+**Key finding:** the forward was *host-arg-packing bound*, not dispatch-bound — banding alone gave only
+1.11×; the win came from precomputing channel-invariant geometry words once per (tile,batch) and patching
+only `col` per band (same Stage-1 trick as the backward). Banding is what *enables* that single precompute.
+
+### Re-profiled Amdahl (step ≈ 98 ms, both channel-parallel)
+late: B=14.8 · raster=20.3 · A=34.0 · D=25.1 · C=3.0
+
+| stage | ms | % | next lever |
+|---|---|---|---|
+| A raster bwd | 34.0 | 35% | matmul re-fusion (#4: A → 1 dispatch); largest single stage |
+| D proj bwd | 25.1 | 26% | **projection-as-matmul (#3)** — now #2 |
+| raster fwd | 20.3 | 21% | mostly done; residual = host arg overhead |
+| B proj fwd | 14.8 | 15% | projection-as-matmul (shared with D) → B+D=40 ms is the largest *combined* target |
+| C Adam | 3.0 | 3% | skip |
+
+→ **Next: projection-as-matmul (#3)** hits B+D (40 ms / 41%); A's matmul re-fusion (#4) is the other lever.
+
 ## How to resume
 - Train with Stage 3: `TT_DEVICE_RESIDENT=1 ttgs blackhole work/scene` (default `TT_FB_STAGE=s3`;
   `=base` to A/B). Gate: `scratchpad/test_grid.py` (set `FB_S2`/`FB_S3`), perf: `scratchpad/bench_S2.py`,
