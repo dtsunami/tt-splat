@@ -126,6 +126,12 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
     excluded = excluded or set()
     if HOST_MAX_POINTS and xyz.shape[0] > HOST_MAX_POINTS:
         idx = torch.randperm(xyz.shape[0])[:HOST_MAX_POINTS]; xyz, rgb = xyz[idx], rgb[idx]
+    _tgt = int(os.environ.get("TT_TARGET_POINTS", "0"))   # densify seed UP to N (jittered replication) for scale tests
+    if _tgt > xyz.shape[0]:
+        rep = (_tgt + xyz.shape[0] - 1) // xyz.shape[0]
+        jit = torch.randn(xyz.shape[0] * rep, 3) * float(xyz.std(0).mean()) * 0.01
+        xyz = (xyz.repeat(rep, 1) + jit)[:_tgt]; rgb = rgb.repeat(rep, 1)[:_tgt]
+        print(f"densified seed -> {xyz.shape[0]} Gaussians (TT_TARGET_POINTS={_tgt})")
 
     # load + downscale images; scale intrinsics; load per-image masks (frames.json -> PNGs)
     views, targets, masks = [], [], []

@@ -25,6 +25,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "docs" / "pathclear"))
 import ttnn                                                # noqa: E402
 from bin_sort import bin_and_sort                          # noqa: E402  M6 per-tile cull + depth sort
+from device_binsort import device_binsort                  # noqa: E402  S2 on-device counting bin/sort
+from raster_blocked import needs_blocking, raster_rgb_blocked, fused_backward_blocked  # noqa: E402  >352px tile-block raster
 import sfpu_raster_scaled as M14                            # noqa: E402  TS, B
 from render_device import _device, _resources, _raster_channel, _raster_rgb   # noqa: E402  M14 forward
 from device_project import project_geom, project_color, project_op   # noqa: E402  Stage B
@@ -100,19 +102,27 @@ class DeviceResidentTrainer:
         if vidx.size:
             cxv, cyv, av, bv, ccv, opv, zcv = (a[valid] for a in (u, v, ca, cb, cc, opn, zc))
             colv = [col[valid, k] for k in range(3)]
-            detc = av * ccv - bv * bv; detc = np.where(np.abs(detc) < 1e-12, 1e-12, detc)
-            var_x = np.clip(ccv / detc, 0.25, None); var_y = np.clip(av / detc, 0.25, None)
-            res = _resources(dev, Wp, Hp)
-            s_gid, _st, ranges, ntx, nty, _tot = bin_and_sort(cxv, cyv, var_x, var_y, zcv, Wp, Hp, ts=TS)
+            blocked = needs_blocking(dev, Wp // TS, Hp // TS)   # >352px: tile-block raster (raster_blocked.py)
+            res = None if blocked else _resources(dev, Wp, Hp)
+            if os.environ.get("TT_DEVICE_BINSORT", "0") == "1":   # S5: on-device counting bin/sort (device_binsort.py)
+                s_gid, _st, ranges, ntx, nty, _tot = device_binsort(dev, cxv, cyv, av, bv, ccv, zcv, Wp, Hp, ts=TS)
+            else:
+                detc = av * ccv - bv * bv; detc = np.where(np.abs(detc) < 1e-12, 1e-12, detc)
+                var_x = np.clip(ccv / detc, 0.25, None); var_y = np.clip(av / detc, 0.25, None)
+                s_gid, _st, ranges, ntx, nty, _tot = bin_and_sort(cxv, cyv, var_x, var_y, zcv, Wp, Hp, ts=TS)
             tile_lists = [s_gid[ranges[t, 0]:ranges[t, 1]].tolist() for t in range(ntx * nty)]
             maxc = max((len(l) for l in tile_lists), default=0)
             nbatch = (maxc + M14.B - 1) // M14.B
             t2 = time.perf_counter(); self.timings["bin"] += t2 - t1
-            _dbg(f"raster fwd (N={N} valid={vidx.size} nbatch={nbatch} ntx={ntx} nty={nty})...")
+            _dbg(f"raster fwd (N={N} valid={vidx.size} nbatch={nbatch} ntx={ntx} nty={nty} blocked={blocked})...")
 
-            # ===== raster forward (M14) =====
-            chans, Tfin = _raster_rgb(dev, res, tile_lists, ntx, nbatch, cxv, cyv, av, bv, ccv, opv,
-                                      colv, Wp, Hp, want_T=True)
+            # ===== raster forward (M14; tile-block loop when >352px) =====
+            if blocked:
+                chans, Tfin = raster_rgb_blocked(dev, tile_lists, ntx, nty, cxv, cyv, av, bv, ccv, opv,
+                                                 colv, Wp, Hp, want_T=True)
+            else:
+                chans, Tfin = _raster_rgb(dev, res, tile_lists, ntx, nbatch, cxv, cyv, av, bv, ccv, opv,
+                                          colv, Wp, Hp, want_T=True)
             img = np.clip(np.stack(chans, axis=-1)[:H, :W, :], 0.0, 1.0)
             _sync(dev); t3 = time.perf_counter(); self.timings["raster"] += t3 - t2
 
@@ -126,10 +136,14 @@ class DeviceResidentTrainer:
             gp = np.zeros((Hp, Wp, 3), np.float64); gp[:H, :W, :] = gi
             t4 = time.perf_counter(); self.timings["loss"] += t4 - t3
 
-            # ===== A: raster backward (grid-sharded) =====
-            gv, cgv = fused_backward_grid(dev, cxv, cyv, av, bv, ccv, opv, colv,
-                                          tile_lists, ntx, Hp // 32, Wp, Hp, gp, Tfin,
-                                          stage=os.environ.get("TT_FB_STAGE", "s4"))   # Stage 4 default (re-fused matmul reduce; -448KB L1, faster)
+            # ===== A: raster backward (grid-sharded; tile-block loop when >352px) =====
+            if blocked:
+                gv, cgv = fused_backward_blocked(dev, cxv, cyv, av, bv, ccv, opv, colv,
+                                                 tile_lists, ntx, nty, Wp, Hp, gp, Tfin)
+            else:
+                gv, cgv = fused_backward_grid(dev, cxv, cyv, av, bv, ccv, opv, colv,
+                                              tile_lists, ntx, Hp // 32, Wp, Hp, gp, Tfin,
+                                              stage=os.environ.get("TT_FB_STAGE", "s4"))   # Stage 4 default
             for key in _GEOM:
                 grads2d[key][vidx] = gv[key]
             for k in range(3):
