@@ -48,12 +48,15 @@
 </header>
 
 <div class="controls">
-  <button id="play" class="primary">▶ Play</button>
-  <button id="step">Step ▷</button>
-  <button id="reset">↺ Reset</button>
-  <span class="slider">β₁ momentum <input id="b1" type="range" min="0" max="0.98" step="0.01" value="0.9"><span id="b1v">0.90</span></span>
-  <span class="slider">β₂ caution <input id="b2" type="range" min="0.9" max="0.9999" step="0.0001" value="0.999"><span id="b2v">0.999</span></span>
-  <span class="slider">lr <input id="lr" type="range" min="0.02" max="0.6" step="0.01" value="0.25"><span id="lrv">0.25</span></span>
+  <button id="play" class="primary" title="Run/pause the animation. The cyan (Adam) and orange (SGD) balls roll downhill one step at a time.">▶ Play</button>
+  <button id="step" title="Advance exactly one optimizer step — watch the gradient/momentum/caution bars update on the right.">Step ▷</button>
+  <button id="reset" title="Send both balls back to the start corner and zero out Adam's memories (m, v, step count).">↺ Reset</button>
+  <span class="slider" title="β₁ — momentum decay. How much of the OLD averaged gradient to keep each step. 0.9 = average ~10 recent gradients (cancels jitter). Drop to 0 = no memory, the raw noisy gradient returns.">β₁ momentum <input id="b1" type="range" min="0" max="0.98" step="0.01" value="0.9"><span id="b1v">0.90</span></span>
+  <span class="slider" title="β₂ — caution decay. How long to remember each axis's bumpiness (running avg of gradient²). 0.999 = long memory (very adaptive). Drop to 0.9 = short memory, reacts faster but less stable.">β₂ caution <input id="b2" type="range" min="0.9" max="0.9999" step="0.0001" value="0.999"><span id="b2v">0.999</span></span>
+  <span class="slider" title="lr — learning rate, the overall step size. Bigger = faster but overshoots/orbits the minimum; smaller = slower but calmer. With 'adaptive lr' on, this is the STARTING rate before the 1/√t decay.">lr <input id="lr" type="range" min="0.02" max="0.6" step="0.01" value="0.18"><span id="lrv">0.18</span></span>
+  <span class="slider" title="Adam's ε: floor under √v. Tiny ε = fully adaptive (per-axis steps). Large ε ⇒ the step stops normalizing and Adam behaves like plain momentum.">ε <input id="eps" type="range" min="-8" max="0.3" step="0.1" value="-8"><span id="epsv">1e-8</span></span>
+  <span class="slider" title="Gradient option: jitter added to the gradient each step (stochastic minibatch noise). 0 = clean gradient ⇒ Adam glides straight; higher = noisier ⇒ momentum's job to cancel it.">noise <input id="noise" type="range" min="0" max="1.5" step="0.05" value="0.5"><span id="noisev">0.50</span></span>
+  <label class="slider" title="Adaptive lr schedule: decay lr like 1/√t so Adam settles INTO the minimum instead of hovering at ~lr-sized steps. On by default; uncheck to watch it oscillate around the min."><input id="anneal" type="checkbox" checked> adaptive lr (anneal)</label>
 </div>
 
 <div class="wrap">
@@ -92,7 +95,17 @@
   cancels the side-to-side jitter and points down the valley. <code>v</code> (yellow) quietly measures how steep each
   axis has been; Adam divides the step by <code>√v</code>, so the <i>steep</i> axis (across the valley) gets tiny steps
   while the <i>flat</i> axis (along the valley) gets big ones — that’s why cyan goes straight where orange bounces.
-  Try dropping <b>β₁ to 0</b> (no momentum → jitter returns) or <b>β₂ to 0.9</b> (short caution memory → less adaptive).
+  <br><br>
+  <b>Why it oscillates around the minimum.</b> Adam normalizes by <code>√v</code>, so each step is about <code>lr</code>-sized
+  <i>regardless of how small the gradient gets</i> — near the bottom it keeps taking ~<code>lr</code> steps and <b>hovers/orbits</b>
+  instead of stopping (the <code>noise</code> keeps <code>v</code> alive, which feeds the jitter). That's real Adam, not a bug.
+  The fix is an <b>adaptive lr schedule</b>: <b>adaptive lr (anneal)</b> decays <code>lr ∝ 1/√t</code> so the step shrinks over time
+  and the ball settles in — it's <b>on by default</b>; uncheck it to watch the orbit return.
+  <br><br>
+  <b>Knobs:</b> <b>ε</b> is Adam's real epsilon — tiny = fully adaptive per-axis; crank it up and the <code>√v</code> normalization
+  washes out (Adam → plain momentum). <b>noise</b> is the gradient jitter (a stand-in for mini-batch noise) — set it to <b>0</b> for a
+  clean gradient and watch cyan glide dead-straight. Also try <b>β₁ to 0</b> (no momentum → jitter returns) or
+  <b>β₂ to 0.9</b> (short caution memory → less adaptive).
 </div>
 
 <script>
@@ -114,18 +127,24 @@ function reset(){
   updatePanel();
 }
 function readControls(){
-  params = { b1:+b1.value, b2:+b2.value, lr:+lr.value, eps:1e-8 };
+  const epsRaw=Math.pow(10,+eps.value);
+  params = { b1:+b1.value, b2:+b2.value, lr:+lr.value, eps:epsRaw,
+             noise:+noise.value, anneal:document.getElementById('anneal').checked };
   b1v.textContent=(+b1.value).toFixed(2); b2v.textContent=(+b2.value).toFixed(4); lrv.textContent=(+lr.value).toFixed(2);
+  epsv.textContent = epsRaw>=0.01 ? epsRaw.toFixed(2) : epsRaw.toExponential(0);
+  noisev.textContent=(+noise.value).toFixed(2);
 }
-['b1','b2','lr'].forEach(id=>document.getElementById(id).addEventListener('input',readControls));
+['b1','b2','lr','eps','noise'].forEach(id=>document.getElementById(id).addEventListener('input',readControls));
+document.getElementById('anneal').addEventListener('change',readControls);
 
-function noitoY(g){ // a little gradient noise so momentum visibly helps
-  return [g[0]+(Math.random()-0.5)*0.6, g[1]+(Math.random()-0.5)*0.6];
+function noisy(g, amp){ // gradient jitter (stochastic-minibatch noise); amp=0 -> clean gradient
+  return [g[0]+(Math.random()-0.5)*2*amp, g[1]+(Math.random()-0.5)*2*amp];
 }
 function adamStep(){
-  const {b1,b2,lr,eps}=params;
+  const {b1,b2,eps,noise,anneal}=params;
   st.t++;
-  const g = noitoY(grad(st.x,st.y)); st.g=g;
+  const lr = anneal ? params.lr/Math.sqrt(st.t) : params.lr;   // 1/√t decay -> Adam settles instead of orbiting
+  const g = noisy(grad(st.x,st.y), noise); st.g=g;
   for(let i=0;i<2;i++){
     st.m[i]=b1*st.m[i]+(1-b1)*g[i];
     st.v[i]=b2*st.v[i]+(1-b2)*g[i]*g[i];
@@ -139,10 +158,10 @@ function adamStep(){
   }
   st.trail.push([st.x,st.y]); if(st.trail.length>400) st.trail.shift();
   st.x-=upd[0]; st.y-=upd[1];
-  // plain SGD ghost, same lr, raw gradient (no memory) -> zig-zag
+  // plain SGD ghost, base lr, raw gradient (no memory) -> zig-zag
   const sg=grad(sgd.x,sgd.y);
   sgd.trail.push([sgd.x,sgd.y]); if(sgd.trail.length>400) sgd.trail.shift();
-  sgd.x-=lr*sg[0]; sgd.y-=lr*sg[1];
+  sgd.x-=params.lr*sg[0]; sgd.y-=params.lr*sg[1];
 }
 
 function draw(){
