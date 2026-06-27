@@ -22,7 +22,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "docs" / "pathclear"))
 import ttnn                                            # noqa: E402
 from train_real import project_general, sh_eval        # noqa: E402
-from render_device import _device, _resources, _raster_channel   # noqa: E402  M14 forward (image + final-T)
+from render_device import _device, _resources, _raster_channel, _raster_rgb   # noqa: E402  M14 forward (image + final-T)
 from bin_sort import bin_and_sort                       # noqa: E402  M6 per-tile cull + depth sort
 import sfpu_raster_scaled as M14                         # noqa: E402  TS, B
 
@@ -111,15 +111,8 @@ class DeviceRaster(torch.autograd.Function):
         tile_lists = [s_gid[ranges[t, 0]:ranges[t, 1]].tolist() for t in range(ntx*nty)]
         maxc = max((len(l) for l in tile_lists), default=0)
         nbatch = (maxc + M14.B - 1)//M14.B
-        chans, Tfin = [], None
-        for k in range(3):
-            r = _raster_channel(dev, res, tile_lists, ntx, nbatch, cxv, cyv, av, bv, cv, opv, colv[k],
-                                Wp, Hp, want_T=(k == 0))     # M14 fused forward; final-T from ch0 (geometry-only)
-            if k == 0:
-                Ck, Tfin = r
-            else:
-                Ck = r
-            chans.append(Ck)
+        chans, Tfin = _raster_rgb(dev, res, tile_lists, ntx, nbatch, cxv, cyv, av, bv, cv, opv, colv,
+                                  Wp, Hp, want_T=True)        # M14 fused forward (banded R/G/B); final-T geometry-only
         img = np.stack(chans, axis=-1)[:H, :W, :]
         ctx.empty = False
         ctx.tile_lists, ctx.ntx, ctx.Tfin, ctx.vidx = tile_lists, ntx, Tfin, vidx

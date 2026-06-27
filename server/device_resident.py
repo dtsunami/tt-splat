@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "docs" / "pathcl
 import ttnn                                                # noqa: E402
 from bin_sort import bin_and_sort                          # noqa: E402  M6 per-tile cull + depth sort
 import sfpu_raster_scaled as M14                            # noqa: E402  TS, B
-from render_device import _device, _resources, _raster_channel   # noqa: E402  M14 forward
+from render_device import _device, _resources, _raster_channel, _raster_rgb   # noqa: E402  M14 forward
 from device_project import project_geom, project_color, project_op   # noqa: E402  Stage B
 from device_project_backward import project_backward        # noqa: E402  Stage D
 from device_adam import DeviceAdam                          # noqa: E402  Stage C
@@ -111,12 +111,8 @@ class DeviceResidentTrainer:
             _dbg(f"raster fwd (N={N} valid={vidx.size} nbatch={nbatch} ntx={ntx} nty={nty})...")
 
             # ===== raster forward (M14) =====
-            chans, Tfin = [], None
-            for k in range(3):
-                r = _raster_channel(dev, res, tile_lists, ntx, nbatch, cxv, cyv, av, bv, ccv, opv,
-                                    colv[k], Wp, Hp, want_T=(k == 0))
-                Ck, Tfin = r if k == 0 else (r, Tfin)
-                chans.append(Ck)
+            chans, Tfin = _raster_rgb(dev, res, tile_lists, ntx, nbatch, cxv, cyv, av, bv, ccv, opv,
+                                      colv, Wp, Hp, want_T=True)
             img = np.clip(np.stack(chans, axis=-1)[:H, :W, :], 0.0, 1.0)
             _sync(dev); t3 = time.perf_counter(); self.timings["raster"] += t3 - t2
 
