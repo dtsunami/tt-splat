@@ -50,3 +50,35 @@ class DeviceAdam:
         self.p[k] = _dt(self.dev, t)
         self.m[k] = _dt(self.dev, torch.zeros_like(t))
         self.v[k] = _dt(self.dev, torch.zeros_like(t))
+
+    # ---- structural / hyperparameter edits (dashboard commands; resident-mode) ----
+    def prune(self, keep_mask):
+        """Drop Gaussians where keep_mask (torch bool [N]) is False, preserving survivors'
+        momentum/variance (slice m/v too — do NOT zero them)."""
+        keep = keep_mask.to(torch.bool)
+        for k in self.keys:
+            self.p[k] = _dt(self.dev, ttnn.to_torch(self.p[k])[keep])
+            self.m[k] = _dt(self.dev, ttnn.to_torch(self.m[k])[keep])
+            self.v[k] = _dt(self.dev, ttnn.to_torch(self.v[k])[keep])
+
+    def fill_param(self, k, value, reset_state=True):
+        """Overwrite param k with a constant (e.g. reset opacities to a logit). Zeroes that
+        param's Adam state by default (a reset is a fresh start for those entries)."""
+        t = torch.full_like(ttnn.to_torch(self.p[k]), float(value))
+        self.p[k] = _dt(self.dev, t)
+        if reset_state:
+            self.m[k] = _dt(self.dev, torch.zeros_like(t))
+            self.v[k] = _dt(self.dev, torch.zeros_like(t))
+
+    def clamp_param(self, k, max_val=None, min_val=None):
+        """Clamp param k in place, keeping its Adam momentum/variance (a clamp is not a reset)."""
+        t = ttnn.to_torch(self.p[k])
+        if max_val is not None:
+            t = t.clamp(max=float(max_val))
+        if min_val is not None:
+            t = t.clamp(min=float(min_val))
+        self.p[k] = _dt(self.dev, t)
+
+    def scale_lr(self, factor):
+        f = float(factor)
+        self.lr = {k: v * f for k, v in self.lr.items()}

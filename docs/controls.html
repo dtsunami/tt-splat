@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Controls &amp; knobs, for humans — tt-splat</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --panel2:#11161d; --ink:#e6edf3; --dim:#9aa7b4; --line:#2a3340;
+    --B:#4af; --raster:#4f8; --A:#f84; --D:#a6f; --C:#0cf; --host:#7a8694;
+    --ok:#7de08a; --warn:#f4d35e; --bad:#ff8a8a; --code:#cde8ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.6 -apple-system,Segoe UI,Roboto,sans-serif; }
+  a { color:var(--B); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  code { background:#0a0d12; padding:1px 6px; border-radius:5px; color:var(--code);
+         font:13px/1.4 'SF Mono',Consolas,monospace; }
+  header { padding:24px 26px 6px; max-width:1100px; }
+  h1 { margin:0 0 8px; font-size:25px; }
+  .sub { color:var(--dim); max-width:1000px; }
+  .sub b { color:var(--ink); }
+  .nav { padding:10px 26px 0; display:flex; flex-wrap:wrap; gap:6px 16px; font-size:13.5px; }
+  .nav a { color:var(--dim); border:1px solid var(--line); border-radius:20px; padding:3px 13px; }
+  .nav a:hover { color:var(--ink); border-color:#3d4a5c; text-decoration:none; }
+
+  section { padding:8px 26px 6px; max-width:1100px; scroll-margin-top:12px; }
+  h2 { font-size:19px; margin:22px 0 4px; display:flex; align-items:center; gap:10px; }
+  .h2note { font-size:13px; color:var(--dim); font-weight:normal; }
+
+  /* status key + pills */
+  .key { display:flex; flex-wrap:wrap; gap:8px 12px; margin:12px 26px 4px; max-width:1100px;
+         font-size:13px; color:var(--dim); }
+  .pill { font-size:11px; padding:2px 9px; border-radius:11px; font-weight:bold; white-space:nowrap;
+          text-transform:uppercase; letter-spacing:.03em; border:1px solid transparent; }
+  .pill.live, .pill.both { background:#14361b; color:var(--ok); border-color:#2c5e34; }
+  .pill.startup, .pill.host { background:#3a3414; color:var(--warn); border-color:#6a5d1c; }
+  .pill.off { background:#3a1a1a; color:var(--bad); border-color:#6a2a2a; }
+
+  .cards { display:flex; gap:14px; flex-wrap:wrap; }
+  .card { background:var(--panel); border:1px solid var(--line); border-left-width:5px; border-radius:11px;
+          padding:13px 16px; width:330px; }
+  .card.g-train { border-left-color:var(--B); }
+  .card.g-qual  { border-left-color:var(--D); }
+  .card.g-dens  { border-left-color:var(--raster); }
+  .card.g-op    { border-left-color:var(--C); }
+  .card.g-met   { border-left-color:var(--A); }
+  .card h3 { margin:0 0 5px; font-size:15px; display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .card h3 .nm { color:var(--ink); }
+  .card .def { color:var(--ink); margin:6px 0 5px; }
+  .card .tip { color:var(--dim); font-size:13.5px; }
+  .card .tip b { color:var(--ink); }
+  .card .meta { margin-top:8px; font-size:12px; color:var(--dim); display:flex; flex-wrap:wrap; gap:3px 12px; }
+  .card .meta code { font-size:12px; }
+
+  .callout { background:var(--panel2); border:1px solid var(--line); border-radius:11px;
+             padding:14px 18px; margin:10px 0; max-width:1100px; }
+  .callout.warn { border-color:#5a4a1c; }
+  .callout h3 { margin:0 0 6px; font-size:15px; }
+  .callout ul { margin:6px 0 0; padding-left:20px; }
+  .callout li { margin:3px 0; color:var(--dim); }
+  .callout li b { color:var(--ink); }
+
+  table { border-collapse:collapse; width:100%; max-width:1100px; font-size:13.5px; margin-top:6px; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--dim); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  td code { font-size:12.5px; }
+  .foot { padding:22px 26px 40px; color:var(--dim); font-size:13px; max-width:1100px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Controls &amp; knobs, for humans 🎛️</h1>
+  <div class="sub">Everything on the tt-splat training dashboard, in plain language — what each button and slider
+  <i>means</i>, when to reach for it, and (just as important) <b>whether it actually does anything on the
+  Tenstorrent backend yet</b>. tt-splat inherited its dashboard from a CUDA/gsplat-style trainer, so a few
+  knobs are still <b>placeholders</b> waiting to be wired into the on-device loop. We mark those honestly.</div>
+</header>
+
+<nav class="nav">
+  <a href="#tldr">TL;DR — what works</a>
+  <a href="#operations">Operations</a>
+  <a href="#params">Meta-parameters</a>
+  <a href="#metrics">Metrics</a>
+  <a href="#modes">Modes &amp; env vars</a>
+  <a href="#pipeline">Pipeline stages</a>
+  <a href="/docs/pipeline_cartoon.html" target="_blank">🎢 pipeline cartoon</a>
+  <a href="/docs/adam_cartoon.html" target="_blank">🧮 Adam cartoon</a>
+  <a href="/docs/algorithm_anim.html" target="_blank">🫧 live animation</a>
+</nav>
+
+<div class="key">
+  <span><b style="color:var(--ink)">Status key:</b></span>
+  <span><span class="pill both">works · both modes</span> honored in host <i>and</i> device-resident training</span>
+  <span><span class="pill host">host only</span> works in host mode; skipped when device-resident</span>
+  <span><span class="pill live">live-editable</span> changes apply mid-run</span>
+  <span><span class="pill startup">startup only</span> read once at run start</span>
+  <span><span class="pill off">not wired</span> placeholder — no effect yet</span>
+</div>
+
+<!-- ───────────── TL;DR ───────────── -->
+<section id="tldr">
+  <div class="callout warn">
+    <h3>⚡ The short version — what actually changes training today</h3>
+    <ul>
+      <li><b>Live &amp; working in BOTH modes</b> (host + device-resident): <code>iterations</code>,
+        <code>save_every</code> (periodic checkpoint), <code>snapshot_every</code>, <code>dashboard_every</code>,
+        <b>Pause/Resume</b>, <b>Save Checkpoint</b>, <b>Focus camera</b>,
+        <b>Prune / Clamp Scale / Reset Opacities</b>, and live per-image mask edits.</li>
+      <li><b>Startup only:</b> <code>sh_degree</code>, <code>TT_SIZE</code>, <code>TT_MAX_POINTS</code>,
+        <code>TT_TARGET_POINTS</code> — set these before you launch.</li>
+      <li><b>Densification (NEW — the fix for "stuck at N"):</b> adaptive clone/split/prune is wired in and
+        <b>ON by default</b> (<code>TT_DENSIFY=1</code>). It auto-runs on the <code>densify_from/until/every</code>
+        schedule (live-editable) and there's a manual <b>Densify</b> button. Hard cap = <code>TT_DENSIFY_MAX</code>
+        (default 100k). Works in host and device-resident mode.</li>
+      <li><b>Profiling:</b> launch with <code>--profile</code> to stream live per-step <b>compute utilization</b>
+        (device-busy % per stage) into the Pipeline-stages telemetry.</li>
+      <li><b>Still not implemented</b> (tracked in <a href="ROADMAP.md">the roadmap</a>):
+        <code>lambda_dssim</code> (the TT loss is pure MSE — a real L1+D-SSIM term is next) and
+        <code>opacity_reset_every</code> (no automatic reset; use the manual Reset Opacities button).</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ───────────── Operations ───────────── -->
+<section id="operations">
+  <h2>🔧 Operations <span class="h2note">— the sidebar buttons you click during a run</span></h2>
+  <div class="cards">
+
+    <div class="card g-op">
+      <h3><span class="nm">Prune</span> <span class="pill both">both modes</span></h3>
+      <div class="def">Delete every Gaussian whose opacity is below the threshold slider — clears floaters and
+        haze and shrinks the model.</div>
+      <div class="tip">Like <b>erasing the faint smudges</b> a sketch picks up. The slider is the opacity cutoff:
+        0.005 is gentle, 0.02+ is aggressive. Pairs naturally with Reset Opacities. In device-resident mode the
+        survivors keep their Adam momentum/variance (sliced, not reset).</div>
+      <div class="meta"><span>cmd <code>prune</code></span><span>host ✅ · resident ✅</span></div>
+    </div>
+
+    <div class="card g-op">
+      <h3><span class="nm">Clamp Scale</span> <span class="pill both">both modes</span></h3>
+      <div class="def">Cap each Gaussian's log-scale (default 2.5) so none can grow into a long needle that streaks
+        across the image.</div>
+      <div class="tip">A <b>haircut for spikes</b>. Reach for it when you see thin bright slivers smearing the
+        render — usually a few overgrown Gaussians.</div>
+      <div class="meta"><span>cmd <code>clamp_scale</code> · <code>max_log_scale=2.5</code></span><span>host ✅ · resident ✅</span></div>
+    </div>
+
+    <div class="card g-op">
+      <h3><span class="nm">Reset Opacities</span> <span class="pill both">both modes</span></h3>
+      <div class="def">Push every Gaussian's opacity back near zero so each one has to re-earn its visibility over
+        the next steps.</div>
+      <div class="tip">A <b>floater amnesty</b>: faint junk that isn't pulling its weight fades out and the optimizer
+        re-grows only what the photos actually need. In CUDA 3DGS this fires automatically every
+        <code>opacity_reset_every</code> — here it's a manual button (automatic reset is a roadmap item).</div>
+      <div class="meta"><span>cmd <code>reset_opacities</code></span><span>host ✅ · resident ✅</span></div>
+    </div>
+
+    <div class="card g-op">
+      <h3><span class="nm">Save Checkpoint</span> <span class="pill both">both modes</span></h3>
+      <div class="def">Write the current model to <code>splat.ply</code> immediately.</div>
+      <div class="tip">Works in every mode. Since there's no periodic auto-save yet, this is how you snapshot a
+        good-looking moment before you keep training (or before you tinker with something risky).</div>
+      <div class="meta"><span>cmd <code>save</code></span><span>host ✅ · resident ✅</span></div>
+    </div>
+
+    <div class="card g-op">
+      <h3><span class="nm">Pause / Resume</span> <span class="pill both">both modes</span></h3>
+      <div class="def">Freeze the training loop between steps without tearing anything down; resume right where it
+        stopped.</div>
+      <div class="tip">Safe to use any time — handy for inspecting the Render | GT | Diff panels, painting a mask,
+        or letting the card cool.</div>
+      <div class="meta"><span><code>/pause</code></span><span>host ✅ · resident ✅</span></div>
+    </div>
+
+    <div class="card g-op">
+      <h3><span class="nm">Focus here</span> <span class="pill both">both modes</span></h3>
+      <div class="def">Lock training to one camera so every step optimizes that single view (instead of cycling all
+        of them).</div>
+      <div class="tip">Great for <b>debugging one region</b> — drive the loss on the view you care about, watch it
+        sharpen, then Clear focus to resume the round-robin. Per-image page; shortcut <code>F</code>.</div>
+      <div class="meta"><span>cmd <code>focus_camera</code></span><span>host ✅ · resident ✅</span></div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ───────────── Meta-parameters ───────────── -->
+<section id="params">
+  <h2>🎚️ Meta-parameters <span class="h2note">— the editable chips in the run bar (and the Edit modal)</span></h2>
+
+  <h2 style="font-size:15px;color:var(--B)">Training</h2>
+  <div class="cards">
+    <div class="card g-train">
+      <h3><span class="nm">Iterations</span> <span class="pill live">live-editable</span></h3>
+      <div class="def">Total optimization steps. <code>iterations</code></div>
+      <div class="tip">More steps refine detail; too many <b>overtrains</b> into floaters and artifacts. If the
+        render looked better a while ago, lower this. The one config knob you can change live and have it stick.</div>
+    </div>
+    <div class="card g-train">
+      <h3><span class="nm">Checkpoint Interval</span> <span class="pill live">live-editable</span></h3>
+      <div class="def">Write <code>splat.ply</code> every N steps. <code>save_every</code></div>
+      <div class="tip">Periodic checkpoint so a crash or a bad edit can't cost you the whole run. 0 = only at the
+        end. You can also force one any time with <b>Save Checkpoint</b>.</div>
+    </div>
+    <div class="card g-train">
+      <h3><span class="nm">Snapshot Interval</span> <span class="pill live">live-editable</span></h3>
+      <div class="def">Save a per-camera render PNG every N steps. <code>snapshot_every</code></div>
+      <div class="tip">Builds a <code>snapshots/{camera}/step_*.png</code> trail you can stitch into a
+        training-progression video with ffmpeg. 0 = off.</div>
+    </div>
+    <div class="card g-train">
+      <h3><span class="nm">Dashboard Refresh</span> <span class="pill live">live-editable</span></h3>
+      <div class="def">Push a live preview every N steps. <code>dashboard_every</code></div>
+      <div class="tip">Lower = smoother monitoring, slightly slower training (each push reads pixels back from the
+        card).</div>
+    </div>
+  </div>
+
+  <h2 style="font-size:15px;color:var(--D)">Quality</h2>
+  <div class="cards">
+    <div class="card g-qual">
+      <h3><span class="nm">DSSIM Weight (λ)</span> <span class="pill off">not wired</span></h3>
+      <div class="def">Blend L1 pixel loss with SSIM structural loss. <code>lambda_dssim</code></div>
+      <div class="tip">In the 3DGS paper the loss is <code>(1−λ)·L1 + λ·(1−SSIM)</code>: λ→0 is sharp but noisy,
+        λ→1 is smooth but blurry. <b>The TT loop currently trains on pure MSE — there's no SSIM term — so this
+        knob is inert.</b> Adding D-SSIM is one of the highest-value gaps vs. gsplat.</div>
+    </div>
+    <div class="card g-qual">
+      <h3><span class="nm">Opacity Reset Interval</span> <span class="pill off">not wired</span></h3>
+      <div class="def">Auto reset opacities every N steps. <code>opacity_reset_every</code></div>
+      <div class="tip">Stock 3DGS periodically fades everything to force a floater cull. <b>No automatic reset is
+        wired into the TT loop yet</b> — use the manual <b>Reset Opacities</b> button (host mode only) instead.</div>
+    </div>
+  </div>
+
+  <h2 style="font-size:15px;color:var(--raster)">Densification <span class="h2note">— wired in &amp; ON by default (the fix for a stuck count)</span></h2>
+  <div class="cards">
+    <div class="card g-dens">
+      <h3><span class="nm">Start / Stop Step</span> <span class="pill live">live-editable</span></h3>
+      <div class="def"><code>densify_from</code> · <code>densify_until</code></div>
+      <div class="tip">The window during which new Gaussians get added — early enough to fill the scene, stopped
+        early enough to leave time for pure refinement. Defaults 500 / 15000.</div>
+    </div>
+    <div class="card g-dens">
+      <h3><span class="nm">Interval</span> <span class="pill live">live-editable</span></h3>
+      <div class="def"><code>densify_every</code></div>
+      <div class="tip">How often, inside that window, the densify pass runs. Lower = more frequent = grows faster. Default 100.</div>
+    </div>
+    <div class="card g-dens">
+      <h3><span class="nm">Gradient Threshold</span> <span class="pill live">live-editable</span></h3>
+      <div class="def"><code>densify_grad_threshold</code></div>
+      <div class="tip">Absolute positional-grad cutoff to clone/split a Gaussian — i.e. when the optimizer keeps
+        dragging one blob around because it can't cover the detail. <b>0 = adaptive</b> (mean+std, recommended).
+        Higher = fewer new Gaussians.</div>
+    </div>
+    <div class="card g-dens">
+      <h3><span class="nm">How it grows</span></h3>
+      <div class="tip"><b>clone</b> small high-grad Gaussians, <b>split</b> large ones into two children (scale/1.6),
+        <b>prune</b> floaters — the proven M7 operators. ON by default (<code>TT_DENSIFY=1</code>), capped at
+        <code>TT_DENSIFY_MAX</code> (100k). The manual <b>Densify</b> button fires one pass now.</div>
+    </div>
+  </div>
+
+  <h2 style="font-size:15px;color:var(--host)">Set at launch (not in the run bar)</h2>
+  <div class="cards">
+    <div class="card g-train" style="border-left-color:var(--host)">
+      <h3><span class="nm">SH degree</span> <span class="pill startup">startup only</span></h3>
+      <div class="def">View-dependent colour bands (0–3). <code>sh_degree</code></div>
+      <div class="tip">0 = flat colour; 3 = full specular/reflective sheen (standard). Higher = more parameters
+        per Gaussian. Baked in when the model is initialized — set via config before the run.</div>
+    </div>
+    <div class="card g-train" style="border-left-color:var(--host)">
+      <h3><span class="nm">Resolution &amp; budget</span> <span class="pill startup">startup only</span></h3>
+      <div class="def"><code>TT_SIZE</code> · <code>TT_MAX_POINTS</code> · <code>TT_TARGET_POINTS</code></div>
+      <div class="tip">Training image size, the cap on how many sparse points seed the model, and an optional
+        densify-the-seed target for scale tests. Environment variables — see <a href="#modes">Modes &amp; env
+        vars</a>.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────── Metrics ───────────── -->
+<section id="metrics">
+  <h2>📊 Metrics <span class="h2note">— the read-outs in the stats bar &amp; loss chart</span></h2>
+  <div class="cards">
+    <div class="card g-met">
+      <h3><span class="nm">Loss / MSE</span></h3>
+      <div class="def">Mean-squared pixel error between render and ground truth.</div>
+      <div class="tip">This is the number the optimizer is actually driving down. Lower is better; watch the blue
+        curve in the chart fall and flatten. <b>Note:</b> the chart's <code>loss</code> and <code>mse</code>
+        series are the same value — <code>mse</code> is fed <code>loss</code> verbatim, so they overlay.</div>
+    </div>
+    <div class="card g-met">
+      <h3><span class="nm">L1</span></h3>
+      <div class="def">Mean absolute pixel error.</div>
+      <div class="tip">A gentler companion to MSE — less dominated by a few very-wrong pixels. Lower is better.</div>
+    </div>
+    <div class="card g-met">
+      <h3><span class="nm">PSNR</span></h3>
+      <div class="def">Peak signal-to-noise ratio in dB between render and ground truth.</div>
+      <div class="tip">Goes <b>up</b> as quality improves (≈30 dB good, ≈40 dB great). Correctly labeled now —
+        this field used to be mislabeled "SSIM". A real structural-similarity (D-SSIM) loss term is a roadmap item.</div>
+    </div>
+    <div class="card g-met">
+      <h3><span class="nm">Gaussians</span></h3>
+      <div class="def">Live count of Gaussians in the model.</div>
+      <div class="tip">Shrinks when you Prune; would grow with densification once that's wired in. A rough proxy for
+        model capacity / file size.</div>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────── Modes & env vars ───────────── -->
+<section id="modes">
+  <h2>🧭 Modes &amp; environment variables <span class="h2note">— how much of the loop runs on the Blackhole</span></h2>
+  <div class="callout">
+    <h3>Three execution modes (set before launch)</h3>
+    <ul>
+      <li><b>Host autograd</b> (default): the verified reference render + torch autograd on the CPU. Correct and
+        flexible — every Operation works — but the slow path. All the structural commands (Prune, Clamp, Reset)
+        are honored here.</li>
+      <li><b>Device render</b> (<code>TT_DEVICE_RENDER=1</code>): the dashboard preview frame is rasterized on the
+        Blackhole (M14); gradients still come from host autograd.</li>
+      <li><b>Device-resident</b> (<code>TT_DEVICE_RESIDENT=1</code>): the full inner loop — projection, raster,
+        both backward passes, and Adam — runs on the card with params + optimizer state resident. This is the
+        scale path (1600 px, 50k+ Gaussians) and the one that lights up the <b>Pipeline stages</b> bar. It
+        <b>skips</b> Prune / Clamp / Reset / set-LR (params never come back to host in the inner loop).</li>
+    </ul>
+  </div>
+  <table>
+    <tr><th>Variable</th><th>What it does</th><th>Typical</th></tr>
+    <tr><td><code>TT_DEVICE_RESIDENT</code></td><td>Run the full device-resident training loop</td><td><code>1</code> for scale</td></tr>
+    <tr><td><code>TT_DEVICE_TRAIN</code></td><td>Fwd+bwd gradients on device (host Adam)</td><td><code>0</code>/<code>1</code></td></tr>
+    <tr><td><code>TT_DEVICE_RENDER</code></td><td>Render the dashboard frame on device (M14)</td><td><code>0</code>/<code>1</code></td></tr>
+    <tr><td><code>TT_SIZE</code></td><td>Training image size (px)</td><td><code>96</code> … <code>1600</code></td></tr>
+    <tr><td><code>TT_MAX_POINTS</code></td><td>Cap on sparse points seeding the model</td><td><code>1200</code> … <code>50000</code></td></tr>
+    <tr><td><code>TT_TARGET_POINTS</code></td><td>Densify the seed up to N (scale tests)</td><td><code>0</code> = off</td></tr>
+    <tr><td><code>TT_DEVICE_BINSORT</code></td><td>On-device counting bin/sort (vs host)</td><td><code>0</code>/<code>1</code></td></tr>
+    <tr><td><code>TT_FB_STAGE</code></td><td>Raster-backward kernel variant</td><td><code>s4</code> (default)</td></tr>
+    <tr><td><code>RESIDENT_DBG</code></td><td>Print per-stage debug lines</td><td><code>0</code>/<code>1</code></td></tr>
+  </table>
+  <p class="sub" style="margin-top:10px">Example — the full-res scale run:
+    <code>TT_TARGET_POINTS=50000 TT_MAX_POINTS=50000 TT_SIZE=1600 TT_DEVICE_RESIDENT=1 ttgs blackhole work/scene --device-resident</code></p>
+</section>
+
+<!-- ───────────── Pipeline stages ───────────── -->
+<section id="pipeline">
+  <h2>🫧 Pipeline stages <span class="h2note">— the colored bar under the preview (device-resident only)</span></h2>
+  <div class="sub">Each training step is a round trip through these stages; the bar shows how many milliseconds each
+    one took on the Blackhole this step, so the tallest segment is your current bottleneck.</div>
+  <table>
+    <tr><th>Stage</th><th>What happens</th><th>Where</th></tr>
+    <tr><td><b style="color:var(--B)">B · project fwd</b></td><td>3D Gaussians → 2D ellipses (position, conic, SH colour, opacity)</td><td>device</td></tr>
+    <tr><td><b style="color:var(--host)">bin</b></td><td>Sort the ellipses into screen tiles by depth</td><td>host glue</td></tr>
+    <tr><td><b style="color:var(--raster)">raster · blend</b></td><td>Front-to-back alpha-blend into the image (M14, on the SFPU)</td><td>device</td></tr>
+    <tr><td><b style="color:var(--host)">loss</b></td><td>Pixel error + dL/dimage</td><td>host glue</td></tr>
+    <tr><td><b style="color:var(--A)">A · raster bwd</b></td><td>Gradient of the blend — usually the tallest bar</td><td>device</td></tr>
+    <tr><td><b style="color:var(--D)">D · project bwd</b></td><td>Carry 2D gradients back to the 3D knobs (analytic)</td><td>device</td></tr>
+    <tr><td><b style="color:var(--C)">C · Adam</b></td><td>Nudge every parameter with momentum</td><td>device</td></tr>
+  </table>
+  <p class="sub" style="margin-top:10px">Full picture with analogies → <a href="/docs/pipeline_cartoon.html" target="_blank">the pipeline cartoon</a>,
+    the optimizer → <a href="/docs/adam_cartoon.html" target="_blank">the Adam cartoon</a>, and a live, data-driven
+    view → <a href="/docs/algorithm_anim.html" target="_blank">the algorithm animation</a>.</p>
+</section>
+
+<div class="foot">
+  Statuses describe <code>server/train_tt.py</code> + <code>server/device_resident.py</code> as of this build.
+  Hover any control on the <a href="/training">training page</a> for the same notes inline. If a knob's behavior
+  changes (e.g. densification gets wired in), update its <code>badge</code> in
+  <code>ttgs/viewer/static/components.js</code> and this page together.
+</div>
+
+</body>
+</html>

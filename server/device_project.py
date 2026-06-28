@@ -10,6 +10,7 @@ the (constant per frame) camera Rv/tv/fx.. folded in as host scalars. Golden = p
   u,v,zc,(a,b,c) = project_geom(dev, mean, scale, quat, cam)   # ttnn [N] tensors out
 """
 from __future__ import annotations
+import numpy as np
 import torch
 import ttnn
 from backend import DEFAULT
@@ -190,3 +191,21 @@ def project_color(dev, mean, sh, deg, cam, aux=False, backend=None):
 def project_op(dev, op_logit, backend=None):
     B = backend or DEFAULT
     return B.sigmoid(op_logit if _is_tt(op_logit) else _dt(dev, op_logit))
+
+
+def aa_factor(ca, cb, cc, dilation=0.3):
+    """Mip-Splatting anti-aliasing opacity compensation (recipe gap #3).  Given the conic (ca,cb,cc) =
+    Σ2D_dilatedᐨ¹ (the +0.3·I EWA-dilated 2D covariance inverse), return per-Gaussian
+    sqrt(det(Σ2D_raw) / det(Σ2D_dilated)) in [0,1] — the factor each opacity is multiplied by so
+    sub-pixel splats shrink (raw covariance recovered by subtracting the dilation).
+    Works on numpy arrays (device-resident path) or torch tensors (host render path)."""
+    is_torch = torch.is_tensor(ca)
+    detc = ca * cc - cb * cb                          # = 1 / det(Σ2D_dilated)
+    detc = detc + (1e-12 if not is_torch else 1e-12)
+    A = cc / detc; Bb = -cb / detc; C = ca / detc     # Σ2D_dilated entries
+    det_dil = A * C - Bb * Bb
+    det_raw = (A - dilation) * (C - dilation) - Bb * Bb
+    ratio = det_raw / (det_dil + 1e-12)
+    if is_torch:
+        return torch.sqrt(ratio.clamp(0.0, 1.0))
+    return np.nan_to_num(np.sqrt(np.clip(ratio, 0.0, 1.0)), nan=1.0)

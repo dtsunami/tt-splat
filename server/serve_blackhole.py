@@ -17,6 +17,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # vendored ttgs package
 sys.path.insert(0, str(Path(__file__).resolve().parent))         # train_tt
 
+# Pre-scan argv so TT_* envs are set BEFORE train_tt imports (it reads TT_DEVICE_RESIDENT at import time).
+if "--profile" in sys.argv:
+    os.environ["TT_PROFILE"] = "1"
+    os.environ.setdefault("TT_METAL_DEVICE_PROFILER", "1")
+    os.environ.setdefault("TT_METAL_PROFILER_MID_RUN_DUMP", "1")
+    os.environ["TT_DEVICE_RESIDENT"] = "1"
+
 from ttgs.config import load as load_config
 from ttgs.backend.detect import Backend, BackendInfo
 from ttgs.viewer.dashboard import DashboardServer
@@ -44,6 +51,8 @@ def main():
     ap.add_argument("--host", default="0.0.0.0",
                     help="Interface to bind (default 0.0.0.0 = all IPs; use 127.0.0.1 for local-only)")
     ap.add_argument("--steps", type=int, default=30000)
+    ap.add_argument("--profile", action="store_true",
+                    help="live per-step device compute-util (enables tt-metal profiler; implies device-resident)")
     a = ap.parse_args()
     dataset, output = Path(a.dataset), Path(a.output)
 

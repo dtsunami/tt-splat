@@ -44,6 +44,14 @@ class TrainConfig:
     densify_until: int = 15_000
     densify_grad_threshold: float = 0.0002
     opacity_reset_every: int = 3_000
+    densify: int = 1           # auto adaptive clone/split/prune on the from/until/every schedule (0=off, 1=on)
+    pose_opt: int = 0          # #1 trainable camera extrinsics (gsplat pose_opt); 0=off, 1=on (live)
+    pose_opt_lr: float = 1e-3  # Adam lr on the per-camera 6-DoF correction δ=(ω,t)
+    pose_opt_reg: float = 1e-4 # L2 prior pulling δ toward 0
+    pose_opt_from: int = 0     # warm-up: optimize poses only after this step
+    sh_warmup: int = 1000      # #2 progressive-SH: ramp effective SH degree, steps per band (0 = full deg from step 1)
+    aa: int = 1                # #3 Mip-Splatting anti-alias opacity compensation (0=off, 1=on)
+    scene_scale_lr: int = 1    # #4 scale mean LR by scene extent so one config transfers across captures (0/1)
     viewer_every: int = 100   # push live viewer update every N steps (when --live)
     dashboard_every: int = 25  # push dashboard snapshot every N steps; first frame always at step 1
     snapshot_every: int = 0    # save per-camera render snapshots every N steps (0 = disabled)

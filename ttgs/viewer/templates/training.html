@@ -117,6 +117,37 @@
     }
     #stats-bar b { color: #fff; }
     .cam-name { color: #4af; font-weight: bold; }
+
+    /* ── Splat tool (bubble gun + eraser) ── */
+    .preview-label { position: relative; z-index: 6; }     /* keep the toolbar above the overlay */
+    .splat-bar { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+    .splat-btn {
+      cursor: pointer; padding: 2px 10px; border-radius: 11px;
+      border: 1px solid #3a4a5a; color: #9cc; background: #162028; user-select: none;
+    }
+    .splat-btn.on { background: #15351a; border-color: #4f8; color: #7de08a; }
+    .splat-mode { display: none; align-items: center; gap: 6px; }
+    .splat-bar.active .splat-mode { display: flex; }
+    .splat-seg {
+      cursor: pointer; padding: 1px 8px; border-radius: 8px;
+      border: 1px solid #333; color: #aaa; user-select: none;
+    }
+    .splat-seg.sel    { background: #15351a; border-color: #4f8; color: #7de08a; }
+    .splat-seg.sel.rm { background: #3a1a1a; border-color: #f66; color: #f99; }
+    .splat-mode label { color: #889; font-size: 10px; }
+    #splat-overlay { position: absolute; inset: 0; z-index: 5; pointer-events: none; }
+    #splat-overlay.active { pointer-events: auto; cursor: crosshair; }
+    #splat-overlay.drive { cursor: grab; }
+    #splat-overlay.drive:active { cursor: grabbing; }
+    #splat-btn.on, .splat-btn.on { background: #2a2317; border-color: #fb4; color: #fb4; }
+    #pose-hud {
+      position: absolute; left: 8px; bottom: 8px; z-index: 6; display: none;
+      background: rgba(12,12,12,0.78); border: 1px solid #333; border-radius: 5px;
+      padding: 5px 9px; font: 11px/1.5 monospace; color: #ccc; pointer-events: none; max-width: 90%;
+    }
+    #pose-hud.show { display: block; }
+    #pose-hud b { color: #fb4; }
+    #pose-hud .hud-corr { color: #8fd; }
   </style>
 </head>
 <body>
@@ -125,6 +156,10 @@
   <a href="/"><b>ttgs</b></a> <span class="sep">|</span>
   <a href="/images">images</a> <span class="sep">|</span>
   <b>training</b>
+  <span class="sep">|</span>
+  <a href="/docs/controls.html" target="_blank" title="Every control &amp; knob, explained for humans">🎛️ controls</a>
+  <a href="/docs/pipeline_cartoon.html" target="_blank" title="How training works, for humans">🎢 pipeline</a>
+  <a href="/docs/algorithm_anim.html" target="_blank" title="Live algorithm animation">🫧 algorithm</a>
   <span class="spacer"></span>
   <span class="poll-status" id="poll-status">waiting...</span>
 </div>
@@ -146,10 +181,25 @@
   <div id="center">
     <!-- render / GT / diff -->
     <div id="preview-row">
-      <div class="preview-cell">
-        <div class="preview-label"><b>Render</b></div>
+      <div class="preview-cell" id="render-cell">
+        <div class="preview-label"><b>Render</b>
+          <span class="spacer"></span>
+          <span class="splat-bar" id="splat-bar" title="Bubble gun: spray new splats (add) where detail is missing, or vacuum up floaters/fog (erase). Aim on the render, click-drag to fire.">
+            <span class="splat-btn" id="splat-toggle" onclick="splatToggle()">🫧 Splat tool</span>
+            <span class="splat-mode">
+              <span class="splat-seg sel" id="splat-add" onclick="splatSetMode('add')">🫧 add</span>
+              <span class="splat-seg rm" id="splat-remove" onclick="splatSetMode('remove')">🧹 erase</span>
+              <label>brush <input type="range" id="splat-brush" min="2" max="60" value="8" style="width:64px;vertical-align:middle"></label>
+            </span>
+          </span>
+          <span class="splat-bar" id="drive-bar" title="Game-style camera drive: WASD = move, Q/E = down/up, Z/C = roll, click-drag on the render = look. Nudges the CURRENT camera's pose (turns pose-opt on). Use it to push a ghosting/misaligned view back into place.">
+            <span class="splat-btn" id="drive-toggle" onclick="driveToggle()">🎮 Drive</span>
+          </span>
+        </div>
         <div class="no-data" id="render-ph">waiting for training...</div>
         <img id="render-img" />
+        <canvas id="splat-overlay"></canvas>
+        <div id="pose-hud"></div>
       </div>
       <div class="preview-cell">
         <div class="preview-label"><b>Ground Truth</b></div>
@@ -176,11 +226,11 @@
 
     <!-- stats bar -->
     <div id="stats-bar">
-      <span>cam: <span class="cam-name" id="st-cam">--</span></span>
-      <span>L1 <b id="st-l1">--</b></span>
-      <span>SSIM <b id="st-ssim">--</b></span>
-      <span>MSE <b id="st-mse">--</b></span>
-      <span><b id="st-n">--</b> gaussians</span>
+      <span data-tip-title="Camera" data-tip="The training view rendered this step. tt-splat cycles through all included cameras (unless you Focus one).">cam: <span class="cam-name" id="st-cam">--</span></span>
+      <span data-tip-title="L1 error" data-tip="Mean absolute difference between the render and the ground-truth photo, per pixel. Lower is better.">L1 <b id="st-l1">--</b></span>
+      <span data-tip-title="PSNR" data-tip="Peak signal-to-noise ratio in dB between render and ground truth — higher is better (≈30 dB good, ≈40 dB great). The training loss now blends L1 + D-SSIM (λ dssim knob).">PSNR <b id="st-psnr">--</b></span>
+      <span data-tip-title="MSE" data-tip="Mean-squared pixel error between render and ground truth — a raw quality stat. (The optimizer minimizes the L1 + D-SSIM loss shown in the run bar, not this.)">MSE <b id="st-mse">--</b></span>
+      <span data-tip-title="Gaussian count" data-tip="How many Gaussians are in the model right now. Prune shrinks it; densification (Densify button / auto-schedule) grows it.">&nbsp;<b id="st-n">--</b> gaussians</span>
       <span class="spacer"></span>
       <span id="st-mask-status" style="color:#555">--</span>
     </div>
@@ -191,6 +241,7 @@
         <span class="sp-title">Pipeline stages</span>
         <span class="muted small">per-step time on the Blackhole</span>
         <span class="spacer"></span>
+        <span id="sp-util" style="display:none;color:#4f8;font-size:11px" title="Busiest Tensix compute core's kernel time as a % of the step — the rest is host glue (arg-pack, readback, bin/sort). Approximate (a lower bound; the on-chip marker buffer can overflow on heavy steps). Appears only with --profile. For rigorous per-op utilization use the offline `python -m tracy` flow."></span>
         <span>step <b id="sp-step" style="color:#fff;font-family:monospace">--</b> ms</span>
         <a href="/docs/pipeline_cartoon.html" target="_blank">&#9432; how training works</a>
       </div>
@@ -200,41 +251,36 @@
 
     <!-- loss chart -->
     <div id="chart-area">
-      <div class="chart-header"><b>Loss</b> L1 / SSIM / MSE</div>
+      <div class="chart-header"><b>Loss</b> loss / L1 &nbsp;·&nbsp; PSNR in the stats bar</div>
       <canvas id="loss-chart" width="900" height="180" style="width:100%;height:100%"></canvas>
     </div>
 
-    <!-- GPU metrics -->
-    <div id="gpu-panel">
-      <div class="gpu-card">
-        <div class="gpu-val" id="gv-util" style="color:#4af">--</div>
-        <canvas class="gpu-spark" id="gs-util" width="120" height="28"></canvas>
-        <div class="gpu-lbl">gpu util</div>
-      </div>
-      <div class="gpu-card">
-        <div class="gpu-val" id="gv-temp" style="color:#f84">--</div>
-        <canvas class="gpu-spark" id="gs-temp" width="120" height="28"></canvas>
-        <div class="gpu-lbl">temperature</div>
-      </div>
+    <!-- Blackhole hardware telemetry (tt-smi) -->
+    <div id="gpu-panel" data-tip-title="Blackhole telemetry" data-tip="Live ASIC telemetry from <b>tt-smi</b> — power, temperature, AICLK, voltage, current and fan for the Tenstorrent card. Read-only over the ARC mailbox (safe alongside training). Watch power vs the 150 W TDP at full-grid resolution.">
       <div class="gpu-card">
         <div class="gpu-val" id="gv-power" style="color:#f44">--</div>
         <canvas class="gpu-spark" id="gs-power" width="120" height="28"></canvas>
         <div class="gpu-lbl">power</div>
       </div>
       <div class="gpu-card">
-        <div class="gpu-val" id="gv-vram" style="color:#a6f">--</div>
-        <canvas class="gpu-spark" id="gs-vram" width="120" height="28"></canvas>
-        <div class="gpu-lbl">vram</div>
+        <div class="gpu-val" id="gv-temp" style="color:#f84">--</div>
+        <canvas class="gpu-spark" id="gs-temp" width="120" height="28"></canvas>
+        <div class="gpu-lbl">asic temp</div>
       </div>
       <div class="gpu-card">
-        <div class="gpu-val" id="gv-freq" style="color:#fd0">--</div>
-        <canvas class="gpu-spark" id="gs-freq" width="120" height="28"></canvas>
-        <div class="gpu-lbl">gpu freq</div>
+        <div class="gpu-val" id="gv-clock" style="color:#fd0">--</div>
+        <canvas class="gpu-spark" id="gs-clock" width="120" height="28"></canvas>
+        <div class="gpu-lbl">aiclk</div>
       </div>
       <div class="gpu-card">
-        <div class="gpu-val" id="gv-vfreq" style="color:#48f">--</div>
-        <canvas class="gpu-spark" id="gs-vfreq" width="120" height="28"></canvas>
-        <div class="gpu-lbl">vram freq</div>
+        <div class="gpu-val" id="gv-volt" style="color:#a6f">--</div>
+        <canvas class="gpu-spark" id="gs-volt" width="120" height="28"></canvas>
+        <div class="gpu-lbl">voltage</div>
+      </div>
+      <div class="gpu-card">
+        <div class="gpu-val" id="gv-curr" style="color:#48f">--</div>
+        <canvas class="gpu-spark" id="gs-curr" width="120" height="28"></canvas>
+        <div class="gpu-lbl">current</div>
       </div>
       <div class="gpu-card">
         <div class="gpu-val" id="gv-fan" style="color:#4f8">--</div>
@@ -268,6 +314,14 @@ function updateStages(t) {
   panel.classList.add('visible');
   const step = t.step || 0;
   document.getElementById('sp-step').textContent = step.toFixed(1);
+  const u = document.getElementById('sp-util');   // device compute-util (only present with --profile)
+  if (u) {
+    if (t.util != null) {
+      u.style.display = '';
+      u.textContent = 'device-busy ' + t.util + '%'
+        + (t.cores ? ' · ' + t.cores + ' cores' : '') + (t.dev_us ? ' · ' + t.dev_us + 'µs' : '');
+    } else { u.style.display = 'none'; }
+  }
   const denom = Math.max(step, 1e-6);
   let segs = '', chips = '';
   for (const s of STAGES) {
@@ -341,12 +395,15 @@ async function tick() {
       // Stats
       document.getElementById('st-cam').textContent = d.camera_name || '--';
       document.getElementById('st-l1').textContent = d.l1.toFixed(4);
-      document.getElementById('st-ssim').textContent = d.ssim.toFixed(4);
+      document.getElementById('st-psnr').textContent = (d.psnr || 0).toFixed(2) + ' dB';
       document.getElementById('st-mse').textContent = d.mse.toFixed(5);
       document.getElementById('st-n').textContent = d.n_gaussians.toLocaleString();
 
       // Pipeline stage breakdown (only present in device-resident training)
       updateStages(d.stage_timings);
+
+      // Pose-opt correction readout (so you can SEE the error being corrected) + drive HUD
+      _updatePoseHud(d);
 
       // Load mask overlay when camera changes
       if (d.camera_name !== _currentCam) {
@@ -375,6 +432,160 @@ async function tick() {
 
 tick();
 setInterval(tick, 500);
+
+// ── Splat tool: bubble gun (add) + eraser (remove) ───────────────────────────
+// Aim on the live render, click-drag to fire. Add = spray new Gaussians (near a surface = densify,
+// in empty space = SfM seed). Erase = vacuum up the Gaussians under the brush (floaters/fog).
+const splatTool = { active:false, mode:'add', brush:8, nPer:3, drawing:false, points:[] };
+
+function splatToggle() {
+  splatTool.active = !splatTool.active;
+  if (splatTool.active && typeof drive !== 'undefined' && drive.active) driveToggle();   // mutually exclusive
+  document.getElementById('splat-toggle').classList.toggle('on', splatTool.active);
+  document.getElementById('splat-bar').classList.toggle('active', splatTool.active);
+  document.getElementById('splat-overlay').classList.toggle('active', splatTool.active);
+  _splatClear();
+}
+function splatSetMode(m) {
+  splatTool.mode = m;
+  document.getElementById('splat-add').classList.toggle('sel', m === 'add');
+  document.getElementById('splat-remove').classList.toggle('sel', m === 'remove');
+}
+function _imgPixel(cx, cy) {                 // client coords -> render pixel coords (object-fit:contain aware)
+  const img = document.getElementById('render-img');
+  const r = img.getBoundingClientRect(), nw = img.naturalWidth, nh = img.naturalHeight;
+  if (!nw || !nh || r.width === 0) return null;
+  const s = Math.min(r.width / nw, r.height / nh);
+  const ox = r.left + (r.width - nw * s) / 2, oy = r.top + (r.height - nh * s) / 2;
+  const px = (cx - ox) / s, py = (cy - oy) / s;
+  if (px < 0 || py < 0 || px >= nw || py >= nh) return null;
+  return [px, py, s];
+}
+function _splatCanvas() {
+  const cv = document.getElementById('splat-overlay');
+  const cell = document.getElementById('render-cell').getBoundingClientRect();
+  if (cv.width !== Math.round(cell.width) || cv.height !== Math.round(cell.height)) {
+    cv.width = Math.round(cell.width); cv.height = Math.round(cell.height);
+  }
+  return cv;
+}
+function _splatClear() {
+  const cv = document.getElementById('splat-overlay'), ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, cv.width, cv.height); splatTool.points = []; splatTool.drawing = false;
+}
+function _splatDraw(ev) {
+  const cv = _splatCanvas(), ctx = cv.getContext('2d');
+  const cell = document.getElementById('render-cell').getBoundingClientRect();
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  const add = splatTool.mode === 'add';
+  const fill = add ? 'rgba(120,224,138,0.22)' : 'rgba(255,90,90,0.20)', line = add ? '#7de08a' : '#ff6a6a';
+  for (const p of splatTool.points) {        // p = [imgpx, imgpy, clientX, clientY, dispR]
+    ctx.beginPath(); ctx.arc(p[2] - cell.left, p[3] - cell.top, p[4], 0, 7);
+    ctx.fillStyle = fill; ctx.fill(); ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.stroke();
+  }
+  if (ev) {                                  // dashed brush cursor
+    const pp = _imgPixel(ev.clientX, ev.clientY);
+    if (pp) {
+      ctx.beginPath(); ctx.arc(ev.clientX - cell.left, ev.clientY - cell.top, splatTool.brush * pp[2], 0, 7);
+      ctx.strokeStyle = line; ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5; ctx.stroke(); ctx.setLineDash([]);
+    }
+  }
+}
+function _splatPush(ev) {
+  const pp = _imgPixel(ev.clientX, ev.clientY);
+  if (!pp) return;
+  const last = splatTool.points[splatTool.points.length - 1];
+  if (last && Math.hypot(pp[0] - last[0], pp[1] - last[1]) < splatTool.brush * 0.6) return;   // throttle (image px)
+  splatTool.points.push([pp[0], pp[1], ev.clientX, ev.clientY, splatTool.brush * pp[2]]);
+}
+async function _splatFire() {
+  const pts = splatTool.points.map(p => [Math.round(p[0]), Math.round(p[1])]);
+  _splatClear();
+  if (!pts.length || !_currentCam) return;
+  const type = splatTool.mode === 'remove' ? 'cull_region' : 'splat_spawn';
+  try { await postCommand(type, { camera_name: _currentCam, points: pts, brush: splatTool.brush, n_per: splatTool.nPer }); }
+  catch (e) { console.warn('splat:', e); }
+}
+(function _splatInit() {
+  const cv = document.getElementById('splat-overlay');
+  if (!cv) return;
+  cv.addEventListener('mousedown',  e => { if (!splatTool.active) return; splatTool.drawing = true; splatTool.points = []; _splatPush(e); _splatDraw(e); });
+  cv.addEventListener('mousemove',  e => { if (!splatTool.active) return; if (splatTool.drawing) _splatPush(e); _splatDraw(e); });
+  cv.addEventListener('mouseup',    () => { if (!splatTool.active) return; splatTool.drawing = false; _splatFire(); });
+  cv.addEventListener('mouseleave', () => { if (splatTool.drawing) { splatTool.drawing = false; _splatFire(); } });
+  const br = document.getElementById('splat-brush');
+  if (br) br.addEventListener('input', () => { splatTool.brush = parseFloat(br.value); });
+})();
+
+// ── Camera Drive: WASD + mouse-look pose nudging (game-style) ────────────────
+// Drives the CURRENT camera's 6-DoF extrinsics — the interactive "grab the ghosting camera and nudge"
+// handle. Reuses the render overlay for mouse capture + a global keydown for WASD/QE/ZC. Inputs are
+// COALESCED and sent at ~10 Hz as one combined pose_nudge(omega,trans), so the command queue (drained
+// once per training step) isn't flooded. Turning Drive on enables pose-opt (driving IS pose-opt).
+// Note: with a ~1 s/step loop the render catches up a step behind the input — expected.
+const drive = { active:false, keys:{}, lookDX:0, lookDY:0, dragging:false, lx:0, ly:0, timer:null,
+                mov:0.02, rot:0.012, look:0.0018 };   // per-tick step sizes (world units / rad)
+
+function _driveTick() {
+  if (!drive.active) return;
+  const o=[0,0,0], t=[0,0,0], k=drive.keys, m=drive.mov, r=drive.rot;
+  if (k['w']) t[2]-=m; if (k['s']) t[2]+=m;      // forward / back
+  if (k['a']) t[0]-=m; if (k['d']) t[0]+=m;      // strafe left / right
+  if (k['q']) t[1]-=m; if (k['e']) t[1]+=m;      // down / up
+  if (k['z']) o[2]-=r; if (k['c']) o[2]+=r;      // roll
+  o[1]+=drive.lookDX*drive.look;                 // mouse X -> yaw
+  o[0]+=drive.lookDY*drive.look;                 // mouse Y -> pitch
+  drive.lookDX=0; drive.lookDY=0;
+  if (o.some(v=>v) || t.some(v=>v)) {
+    if (!poseNudgeRaw(o, t)) { /* no active camera yet */ }
+  }
+}
+
+function driveToggle() {
+  drive.active = !drive.active;
+  const btn=document.getElementById('drive-toggle'), cv=document.getElementById('splat-overlay');
+  btn.classList.toggle('on', drive.active);
+  document.getElementById('pose-hud').classList.toggle('show', drive.active);
+  if (drive.active) {
+    if (typeof splatTool!=='undefined' && splatTool.active) splatToggle();   // mutually exclusive w/ bubble gun
+    cv.classList.add('active'); cv.classList.add('drive');
+    if (typeof postConfig==='function') postConfig({pose_opt: 1});           // driving IS pose-opt → ensure on
+    if (!drive.timer) drive.timer=setInterval(_driveTick, 100);             // 10 Hz coalesced send
+  } else {
+    cv.classList.remove('active'); cv.classList.remove('drive');
+    drive.keys={}; drive.lookDX=drive.lookDY=0; drive.dragging=false;
+    if (drive.timer) { clearInterval(drive.timer); drive.timer=null; }
+  }
+}
+
+function _updatePoseHud(d) {
+  const hud=document.getElementById('pose-hud'); if(!hud) return;
+  const pc = d && d.pose_corr;
+  const corr = pc ? `Δrot ${pc.dw_deg.toFixed(2)}°  Δpos ${pc.dt.toFixed(3)}`
+                  : 'pose-opt off (enable in Camera Pose-Opt, or hit Drive)';
+  hud.innerHTML = drive.active
+    ? `<b>🎮 Drive</b> WASD move · QE down/up · ZC roll · drag = look<br><span class="hud-corr">${corr}</span>`
+    : `<span class="hud-corr">${corr}</span>`;
+  hud.classList.toggle('show', drive.active || !!pc);   // show whenever there's a correction to see
+}
+
+// keyboard (only while Drive is on, and not while typing in a field)
+document.addEventListener('keydown', e => {
+  if (!drive.active) return;
+  const tag=(e.target&&e.target.tagName)||'';
+  if (tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT') return;
+  const k=(e.key||'').toLowerCase();
+  if ('wasdqezc'.indexOf(k)>=0 && k.length===1) { drive.keys[k]=true; e.preventDefault(); }
+});
+document.addEventListener('keyup', e => { const k=(e.key||'').toLowerCase(); if (drive.keys[k]!==undefined) drive.keys[k]=false; });
+
+// mouse-look: drag on the render overlay (drive handlers coexist with the splat ones; each guards its tool)
+(function _driveMouseInit(){
+  const cv=document.getElementById('splat-overlay'); if(!cv) return;
+  cv.addEventListener('mousedown', e => { if(!drive.active) return; drive.dragging=true; drive.lx=e.clientX; drive.ly=e.clientY; e.preventDefault(); });
+  cv.addEventListener('mousemove', e => { if(!drive.active||!drive.dragging) return; drive.lookDX+=e.clientX-drive.lx; drive.lookDY+=e.clientY-drive.ly; drive.lx=e.clientX; drive.ly=e.clientY; });
+  window.addEventListener('mouseup', () => { drive.dragging=false; });
+})();
 
 // ── GPU metrics ────────────────────────────────────────────────────────────
 const _gpuHist = {};
@@ -425,13 +636,12 @@ async function pollGpu() {
     const d = await r.json();
     if (!d.available) return;
     document.getElementById('gpu-panel').classList.add('visible');
-    _gpuCard('util',  d.gpu_util_pct,  '%',   '#4af', {fixedMin:0, fixedMax:100});
-    _gpuCard('temp',  d.gpu_temp_c,    '\u00b0C', '#f84');
-    _gpuCard('power', d.gpu_power_w,   'W',   '#f44');
-    _gpuCard('vram',  d.vram_used_gb,  'GB',  '#a6f', {max: d.vram_total_gb, fixedMin:0, fixedMax: d.vram_total_gb});
-    _gpuCard('freq',  d.gpu_freq_mhz,  'MHz', '#fd0');
-    _gpuCard('vfreq', d.vram_freq_mhz, 'MHz', '#48f');
-    _gpuCard('fan',   d.fan_rpm,       'RPM', '#4f8');
+    _gpuCard('power', d.power_w,   'W',   '#f44', {max: d.tdp_w, fixedMin:0, fixedMax: d.tdp_w});
+    _gpuCard('temp',  d.temp_c,    '\u00b0C', '#f84', {fixedMin:0, fixedMax: d.temp_limit_c});
+    _gpuCard('clock', d.aiclk_mhz, 'MHz', '#fd0', {fixedMin:0, fixedMax: d.aiclk_max_mhz});
+    _gpuCard('volt',  d.voltage_v, 'V',   '#a6f');
+    _gpuCard('curr',  d.current_a, 'A',   '#48f', {fixedMin:0, fixedMax: d.tdc_a});
+    _gpuCard('fan',   d.fan,       '',    '#4f8');
   } catch(e) {}
 }
 pollGpu();

@@ -352,6 +352,9 @@ def blackhole(
     device_resident: bool = typer.Option(False, "--device-resident",
                                          help="FULL device-resident loop: B/raster/A/D/C + Adam on the Blackhole, "
                                               "params resident; streams per-stage telemetry to /training"),
+    profile: bool = typer.Option(False, "--profile",
+                                 help="Stream live per-step device compute-utilization into the stage telemetry "
+                                      "(enables the tt-metal device profiler; implies --device-resident)"),
 ) -> None:
     """[bold]Train on Tenstorrent Blackhole[/] — the ttgs dashboard driving the TT pipeline.
 
@@ -385,7 +388,13 @@ def blackhole(
         env["TT_DEVICE_TRAIN"] = "1"         # train_tt runs fwd+bwd gradients on-device (small scale)
     if device_resident:
         env["TT_DEVICE_RESIDENT"] = "1"      # full device-resident loop + per-stage telemetry
-    tag = ("  (device resident)" if device_resident else "  (device train)" if device_train
+    if profile:
+        env["TT_PROFILE"] = "1"                       # live per-step device compute-util
+        env["TT_METAL_DEVICE_PROFILER"] = "1"         # firmware kernel-zone capture (tree is profiler-enabled)
+        env["TT_METAL_PROFILER_MID_RUN_DUMP"] = "1"   # flush zones to the CSV each ReadDeviceProfiler (not just at close)
+        env["TT_DEVICE_RESIDENT"] = "1"               # util telemetry only exists on the resident loop
+    tag = ("  (profiled)" if profile else "  (device resident)" if device_resident
+           else "  (device train)" if device_train
            else "  (device render)" if device_render else "")
     console.print(f"[dim]→ {' '.join(cmd)}{tag}[/]")
     raise typer.Exit(subprocess.call(cmd, env=env))

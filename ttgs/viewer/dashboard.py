@@ -231,17 +231,18 @@ def build_update(
     is_paused: bool = False,
     focus_camera: str | None = None,
     l1: float = 0.0,
-    ssim: float = 0.0,
+    psnr: float = 0.0,
     mse: float = 0.0,
     stage_timings: dict[str, float] | None = None,
+    pose_corr: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     update = {
         "step":         step,
         "total_steps":  total_steps,
         "loss":         round(float(loss), 6),
         "l1":           round(float(l1), 6),
-        "ssim":         round(float(ssim), 6),
-        "mse":          round(float(mse), 6),
+        "psnr":         round(float(psnr), 3),   # dB (was mislabeled "ssim"); higher is better
+        "mse":          round(float(mse), 6),    # == loss on the TT path (kept for the stats bar)
         "n_gaussians":  int(n_gaussians),
         "camera_name":  camera_name,
         "is_paused":    is_paused,
@@ -252,6 +253,9 @@ def build_update(
     }
     if stage_timings is not None:    # device-resident per-stage wall (ms): B/bin/raster/loss/A/D/C/step
         update["stage_timings"] = {k: round(float(v), 2) for k, v in stage_timings.items()}
+    if pose_corr is not None:        # #1 pose-opt: this camera's current 6-DoF correction magnitude
+        update["pose_corr"] = {"dw_deg": round(float(pose_corr.get("dw_deg", 0.0)), 4),
+                               "dt": round(float(pose_corr.get("dt", 0.0)), 5)}
     return update
 
 
@@ -266,6 +270,11 @@ class _CommandPayload(BaseModel):
     max_log_scale: float        = 2.5
     lr_factor:     float        = 1.0
     camera_name:   str | None   = None
+    points:        Any          = None     # bubble-gun screen points [[x,y], ...]
+    n_per:         int          = 3        # splats spawned per click point
+    brush:         float        = 4.0      # spawn jitter / depth-search radius (px)
+    omega:         Any          = None     # pose_nudge: so(3) rotation correction [rx,ry,rz] (rad)
+    trans:         Any          = None     # pose_nudge: translation correction [tx,ty,tz] (world units)
 
 class _PipelineRunPayload(BaseModel):
     from_stage: str
@@ -299,11 +308,19 @@ _MCP_TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "name": {"type": ["string", "null"]}}, "required": ["name"]}},
     {"name": "densify_now",
-     "description": "Force a densification pass on the next step.",
+     "description": "Clone/split high-gradient Gaussians + prune floaters now — grows the model toward detail.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "reset_opacities",
      "description": "Reset all opacities to near-zero.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "pose_nudge",
+     "description": "Nudge one camera's pose (requires pose_opt on — set via update_config{pose_opt:1}). "
+                    "'grab the ghosting camera and nudge' — omega=so(3) rotation [rx,ry,rz] rad, "
+                    "trans=[tx,ty,tz] world units.",
+     "inputSchema": {"type": "object", "properties": {
+         "name":  {"type": "string"},
+         "omega": {"type": "array", "items": {"type": "number"}},
+         "trans": {"type": "array", "items": {"type": "number"}}}, "required": ["name"]}},
     {"name": "save_checkpoint",
      "description": "Save checkpoint immediately.",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -329,18 +346,26 @@ _MCP_TOOLS = [
      "description": "Get current live training config (iterations, save_every, snapshot_every, etc.).",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "update_config",
-     "description": "Update training config on-the-fly. Pass any TrainConfig fields to change.",
+     "description": "Update training config on-the-fly. All fields below are honored live by the TT backend.",
      "inputSchema": {"type": "object", "properties": {
-         "iterations":        {"type": "integer", "description": "Max training steps"},
-         "save_every":        {"type": "integer", "description": "Checkpoint interval (0=end only)"},
+         "iterations":        {"type": "integer", "description": "Max training steps (live)"},
+         "save_every":        {"type": "integer", "description": "Periodic splat.ply checkpoint every N steps (0=end only)"},
          "snapshot_every":    {"type": "integer", "description": "Per-camera snapshot interval (0=off)"},
-         "dashboard_every":   {"type": "integer", "description": "Dashboard push interval"},
-         "lambda_dssim":      {"type": "number",  "description": "SSIM loss weight (0-1)"},
-         "densify_from":      {"type": "integer", "description": "Start densifying at step N"},
-         "densify_until":     {"type": "integer", "description": "Stop densifying at step N"},
-         "densify_every":     {"type": "integer", "description": "Densify interval"},
-         "densify_grad_threshold": {"type": "number", "description": "Gradient threshold for densify"},
-         "opacity_reset_every":    {"type": "integer", "description": "Opacity reset interval (0=off)"},
+         "dashboard_every":   {"type": "integer", "description": "Dashboard push interval (live)"},
+         "lambda_dssim":      {"type": "number",  "description": "D-SSIM loss weight: (1-λ)·L1 + λ·(1-SSIM)"},
+         "densify_from":      {"type": "integer", "description": "Step to start adaptive densification"},
+         "densify_until":     {"type": "integer", "description": "Step to stop densification"},
+         "densify_every":     {"type": "integer", "description": "Densify interval in steps"},
+         "densify_grad_threshold": {"type": "number", "description": "Positional-grad cutoff to clone/split (0 = adaptive mean+std)"},
+         "opacity_reset_every": {"type": "integer", "description": "Periodic opacity-reset cadence (densify floater safeguard; 0=off)"},
+         "densify":           {"type": "integer", "description": "#5 auto adaptive densification (clone/split/prune) on the from/until/every schedule: 1=on, 0=off (live). Default on."},
+         "pose_opt":      {"type": "integer", "description": "#1 trainable camera extrinsics (gsplat pose_opt): 1=on, 0=off"},
+         "pose_opt_lr":   {"type": "number",  "description": "Adam lr on the per-camera 6-DoF correction δ=(ω,t)"},
+         "pose_opt_reg":  {"type": "number",  "description": "L2 prior pulling the pose correction δ toward 0"},
+         "pose_opt_from": {"type": "integer", "description": "Warm-up: optimize poses only after this step"},
+         "sh_warmup":     {"type": "integer", "description": "#2 progressive-SH: steps per SH band (0=full degree from step 1). Default 1000; applied at run start."},
+         "aa":            {"type": "integer", "description": "#3 Mip-Splatting anti-alias opacity compensation: 1=on, 0=off. Default on; applied at run start."},
+         "scene_scale_lr":{"type": "integer", "description": "#4 scale mean LR by scene extent for cross-capture transfer: 1=on, 0=off. Default on; applied at run start."},
      }}},
 ]
 
@@ -362,10 +387,10 @@ def build_app(pipeline):
     # PipelineController creates a fresh TrainingController for each run,
     # so a snapshot taken here would go stale.
 
-    # GPU hardware monitor (optional — degrades gracefully)
+    # Blackhole hardware monitor via tt-smi (optional — degrades gracefully)
     _gpu_mon = None
     try:
-        from ttgs.backend.monitor import GpuMonitor
+        from ttgs.backend.tt_monitor import TtSmiMonitor as GpuMonitor
         _gpu_mon = GpuMonitor()
         if _gpu_mon.available:
             _gpu_mon.start()
@@ -690,11 +715,19 @@ def build_app(pipeline):
 
         if tool == "densify_now":
             pipeline.training.queue_command({"type": "densify_now"})
-            return tok(txt("densify_now queued"))
+            return tok(txt("densify_now queued — clone/split high-grad Gaussians + prune floaters next step."))
 
         if tool == "reset_opacities":
             pipeline.training.queue_command({"type": "reset_opacities"})
             return tok(txt("reset_opacities queued"))
+
+        if tool == "pose_nudge":
+            n = args.get("name")
+            if not n: return terr("'name' required")
+            pipeline.training.queue_command({"type": "pose_nudge", "camera_name": n,
+                                             "omega": args.get("omega", [0, 0, 0]),
+                                             "trans": args.get("trans", [0, 0, 0])})
+            return tok(txt(f"pose_nudge queued for {n!r} (ω={args.get('omega')}, t={args.get('trans')})"))
 
         if tool == "save_checkpoint":
             pipeline.training.queue_command({"type": "save"})

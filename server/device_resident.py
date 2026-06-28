@@ -51,16 +51,32 @@ def _sync(dev):
 
 
 class DeviceResidentTrainer:
-    def __init__(self, dev, P, lr=None, deg=None):
+    def __init__(self, dev, P, lr=None, deg=None, lambda_dssim=0.2, sh_interval=0, aa=False):
         self.dev = dev
         self.deg = int(P["deg"] if deg is None else deg)
+        self.lambda_dssim = float(lambda_dssim)    # L1 + D-SSIM loss (0 = pure L1; 3DGS default 0.2)
+        self.sh_interval = int(sh_interval)        # progressive-SH: steps per band (0 = full deg, warmup off)
+        self.deg_eff = self.deg                    # effective SH degree this step (ramps under warmup)
+        self.aa = bool(aa)                         # Mip-Splatting anti-alias opacity compensation
+        self.last_screen = None                    # last step's per-Gaussian (u,v,zc,du,dv,valid) for pose-opt
         init = {k: P[k].detach().clone() for k in ("mean", "scale", "quat", "op", "sh")}
         self.K = init["sh"].shape[1]
         lr = lr or {"mean": .01, "scale": .01, "quat": .01, "op": .02, "sh": .01}
         self.adam = DeviceAdam(dev, init, lr)              # params + m/v resident on device
         self.timings = {k: 0.0 for k in ("B", "bin", "raster", "loss", "A", "D", "C", "step")}
         self.nstep = 0
+        self.N = int(init["mean"].shape[0])   # live Gaussian count (mutated by prune)
         self.step_log = []          # per-step {stage: ms} — for profiling the ramp/stall curve
+        self._gpos = np.zeros(self.N, dtype=np.float64)   # accumulated 2D positional-grad magnitude (densify signal)
+        self._gacc = 0
+        self.profiler = None        # --profile / TT_PROFILE=1: live per-step device compute-util
+        if os.environ.get("TT_PROFILE", "0") == "1":
+            try:
+                from profiler import DeviceProfiler
+                self.profiler = DeviceProfiler()
+                print("  [resident] --profile ON — live per-step device compute-util (tt-metal device profiler)")
+            except Exception as exc:
+                print(f"  [resident] profiler unavailable ({type(exc).__name__}: {exc}); continuing without util")
 
     # ---- resident params (ttnn) ----
     @property
@@ -75,13 +91,18 @@ class DeviceResidentTrainer:
         H, W = gt.shape[:2]
         t0 = time.perf_counter()
 
+        # progressive-SH warmup (recipe gap #2): ramp the EFFECTIVE degree 0->deg over the run so high-freq
+        # view-dependent colour isn't fit before geometry settles. sh is full-size; only the first
+        # (deg_eff+1)^2 bands contribute fwd, and the rest get ZERO grad in Stage D (padded there).
+        self.deg_eff = self.deg if self.sh_interval <= 0 else min(self.deg, self.nstep // self.sh_interval)
+
         # ===== B: device projection forward (reads resident params) =====
         _dbg("B: project_geom...")
         p = self._p
         u_t, v_t, zc_t, (ca_t, cb_t, cc_t), Ageo = project_geom(
             dev, p["mean"], p["scale"], p["quat"], cam, aux=True)
         _dbg("B: project_color...")
-        cR_t, cG_t, cB_t, Acol = project_color(dev, p["mean"], p["sh"], self.deg, cam, aux=True)
+        cR_t, cG_t, cB_t, Acol = project_color(dev, p["mean"], p["sh"], self.deg_eff, cam, aux=True)
         _dbg("B: project_op + 2D readback...")
         op_t = project_op(dev, p["op"])
         g = lambda t: ttnn.to_torch(t).flatten().numpy().astype(np.float64)   # 2D readback (deferred bin)
@@ -89,8 +110,15 @@ class DeviceResidentTrainer:
         ca, cb, cc = g(ca_t), g(cb_t), g(cc_t)
         opn = g(op_t); col = np.stack([g(cR_t), g(cG_t), g(cB_t)], axis=-1)
         N = u.shape[0]
+        # Mip-Splatting anti-aliasing (recipe gap #3): scale opacity by sqrt(det ratio) (<=1) so sub-pixel
+        # splats shrink. Computed from the read-back conic (no extra device op). The op-grad is scaled to
+        # match in Stage D below (the factor's coupling to scale/quat is a 2nd-order term, left out).
+        aaf = None
+        if self.aa:
+            from device_project import aa_factor
+            aaf = aa_factor(ca, cb, cc)
+            opn = opn * aaf
         _sync(dev); t1 = time.perf_counter(); self.timings["B"] += t1 - t0
-
         # ===== bin/sort (host, deferred) + cull =====
         TS = M14.TS
         Wp, Hp = ((W + TS - 1) // TS) * TS, ((H + TS - 1) // TS) * TS
@@ -125,14 +153,11 @@ class DeviceResidentTrainer:
                                           colv, Wp, Hp, want_T=True)
             img = np.clip(np.stack(chans, axis=-1)[:H, :W, :], 0.0, 1.0)
             _sync(dev); t3 = time.perf_counter(); self.timings["raster"] += t3 - t2
-
-            # ===== loss + dL/dimage (host) =====
-            diff = img - gt
-            if mask is not None:
-                mk = mask.detach().cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)
-                diff = diff * mk[..., None]
-            loss = float((diff ** 2).mean())
-            gi = (2.0 * diff / diff.size)
+            # ===== loss (L1 + D-SSIM) + dL/dimage (host, via autograd) =====
+            from loss import dloss_dimage
+            mk = (mask.detach().cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)) \
+                if mask is not None else None
+            loss, gi = dloss_dimage(img, gt, mk, self.lambda_dssim)
             gp = np.zeros((Hp, Wp, 3), np.float64); gp[:H, :W, :] = gi
             t4 = time.perf_counter(); self.timings["loss"] += t4 - t3
 
@@ -148,31 +173,44 @@ class DeviceResidentTrainer:
                 grads2d[key][vidx] = gv[key]
             for k in range(3):
                 col_g[k][vidx] = cgv[k]
+            if aaf is not None:                # AA: dL/d(sigmoid_op) = dL/d(eff_op)*aa (eff_op = sigmoid*aa)
+                grads2d["op"] = grads2d["op"] * aaf
             _dbg("A done")
             _sync(dev); t5 = time.perf_counter(); self.timings["A"] += t5 - t4
         else:
             loss = float((img - gt).__pow__(2).mean())
             t5 = time.perf_counter()
 
+        self._gpos += np.sqrt(grads2d["cx"] ** 2 + grads2d["cy"] ** 2)   # densify signal: screen-space ‖∂L/∂(u,v)‖
+        self._gacc += 1
+        # cache per-Gaussian screen state for host-side camera pose-opt (recipe gap #1): dL/du=cx, dL/dv=cy
+        self.last_screen = dict(u=u, v=v, zc=zc, du=grads2d["cx"], dv=grads2d["cy"], valid=valid)
+
         # ===== D: device projection backward (reuse B aux) =====
         up = dict(u=grads2d["cx"], v=grads2d["cy"], ca=grads2d["a"], cb=grads2d["b"], cc=grads2d["c"],
                   op=grads2d["op"], colR=col_g[0], colG=col_g[1], colB=col_g[2])
-        Pd = dict(mean=p["mean"], scale=p["scale"], quat=p["quat"], sh=p["sh"], op=p["op"], deg=self.deg)
+        Pd = dict(mean=p["mean"], scale=p["scale"], quat=p["quat"], sh=p["sh"], op=p["op"], deg=self.deg_eff)
         _dbg("D: project_backward...")
         g3 = project_backward(dev, Pd, cam, up, aux=(Ageo, Acol), return_ttnn=True)  # grads stay resident
         self.last_g3 = g3                                  # ttnn; grad-equivalence gate reads via to_torch
         _sync(dev); t6 = time.perf_counter(); self.timings["D"] += t6 - t5
-
         # ===== C: device Adam (resident grads -> NO host round-trip) =====
         _dbg("C: adam.step...")
         self.adam.step({k: g3[k] for k in ("mean", "scale", "quat", "op", "sh")})
         _sync(dev); t7 = time.perf_counter(); self.timings["C"] += t7 - t6
         self.timings["step"] += t7 - t0
         self.nstep += 1
-        self.step_log.append(dict(
+        _log = dict(
             B=1e3 * (t1 - t0), bin=1e3 * (t2 - t1) if vidx.size else 0.0,
-            raster=1e3 * (t3 - t2) if vidx.size else 0.0, A=1e3 * (t5 - t4) if vidx.size else 0.0,
-            D=1e3 * (t6 - t5), C=1e3 * (t7 - t6), step=1e3 * (t7 - t0)))
+            raster=1e3 * (t3 - t2) if vidx.size else 0.0,
+            loss=1e3 * (t4 - t3) if vidx.size else 0.0, A=1e3 * (t5 - t4) if vidx.size else 0.0,
+            D=1e3 * (t6 - t5), C=1e3 * (t7 - t6), step=1e3 * (t7 - t0))
+        if self.profiler is not None:        # adds util/dev_us/cores (device-side; --profile only)
+            try:                              # one read after the step (cheap; util is a lower bound under heavy marker load)
+                _log.update(self.profiler.step(dev, _log["step"]))
+            except Exception:
+                pass
+        self.step_log.append(_log)
         return loss, img.astype(np.float32)
 
     def params_host(self):
@@ -187,3 +225,67 @@ class DeviceResidentTrainer:
         order = ["B", "bin", "raster", "loss", "A", "D", "C", "step"]
         line = "  ".join(f"{k}={ms[k]:.1f}" for k in order)
         return f"per-step ms (avg over {n}):  {line}"
+
+    # ---- dashboard commands on the RESIDENT params (no host autograd; params stay on device) ----
+    def prune(self, threshold):
+        """Drop Gaussians with sigmoid(op) <= threshold, preserving survivors' Adam state.
+        Returns the new Gaussian count."""
+        op = ttnn.to_torch(self._p["op"]).reshape(-1)
+        keep = torch.sigmoid(op) > float(threshold)
+        nkeep = int(keep.sum().item())
+        if nkeep == 0 or nkeep == keep.numel():
+            return self.N                       # refuse a prune that would empty or change nothing
+        self.adam.prune(keep)
+        self.N = nkeep
+        return nkeep
+
+    def reset_opacities(self, prob=0.01):
+        import math
+        self.adam.fill_param("op", math.log(prob / (1.0 - prob)))   # op is a logit
+
+    def clamp_scale(self, max_log_scale):
+        self.adam.clamp_param("scale", max_val=max_log_scale)
+
+    def set_lr(self, factor):
+        self.adam.scale_lr(factor)
+
+    def densify(self, grad_threshold=0.0, n_max=100000):
+        """Clone/split/prune the resident Gaussians from the accumulated screen-space positional grad,
+        then rebuild the resident DeviceAdam at the new N (fresh m/v — the proven M7 reshape). Returns stats."""
+        from densify import densify_3d
+        Ph = self.params_host()                                   # torch dict mean/scale/quat/op/sh + deg
+        g = torch.from_numpy(self._gpos / max(self._gacc, 1)).float()
+        newP, st = densify_3d(Ph, g, grad_threshold=grad_threshold, n_max=n_max)
+        init = {k: newP[k].detach() for k in ("mean", "scale", "quat", "op", "sh")}
+        t_keep = self.adam.t
+        self.adam = DeviceAdam(self.dev, init, self.adam.lr, self.adam.b1, self.adam.b2, self.adam.eps)
+        self.adam.t = t_keep                                      # keep Adam bias-correction continuity
+        self.N = int(init["mean"].shape[0])
+        self._gpos = np.zeros(self.N, dtype=np.float64); self._gacc = 0
+        return st
+
+    def cull(self, keep_mask):
+        """Interactive eraser: delete the Gaussians where keep_mask (torch/np bool [N]) is False
+        (e.g. floaters/fog the human brushed over). Returns the new count."""
+        keep = torch.as_tensor(np.asarray(keep_mask)).to(torch.bool)
+        nkeep = int(keep.sum().item())
+        if nkeep == 0 or nkeep == self.N:
+            return self.N                        # refuse to empty the scene or no-op
+        self.adam.prune(keep)
+        self.N = nkeep
+        self._gpos = np.zeros(self.N, dtype=np.float64); self._gacc = 0
+        return self.N
+
+    def spawn(self, means, colors):
+        """Bubble gun: append new Gaussians at world `means` [M,3] with RGB `colors` [M,3], then
+        rebuild the resident DeviceAdam at the new N. Returns the new count."""
+        from densify import spawn_gaussians
+        Ph = self.params_host()
+        newP = spawn_gaussians(Ph, torch.as_tensor(np.asarray(means)), torch.as_tensor(np.asarray(colors)))
+        init = {k: newP[k].detach() for k in ("mean", "scale", "quat", "op", "sh")}
+        t_keep = self.adam.t
+        self.adam = DeviceAdam(self.dev, init, self.adam.lr, self.adam.b1, self.adam.b2, self.adam.eps)
+        self.adam.t = t_keep
+        self.N = int(init["mean"].shape[0])
+        self._gpos = np.zeros(self.N, dtype=np.float64); self._gacc = 0
+        return self.N

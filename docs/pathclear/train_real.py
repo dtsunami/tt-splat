@@ -60,8 +60,10 @@ def project_general(P, Rv, tv, fx, fy, cx, cy):
     return u, v, mc[:, 2], (c_/det, -b_/det, a_/det)
 
 
-def render(P, cam, H, W, PX, PY):
-    """RGB front-to-back compositing with SH view-dependent colour -> [H,W,3]."""
+def render(P, cam, H, W, PX, PY, aa=False):
+    """RGB front-to-back compositing with SH view-dependent colour -> [H,W,3].
+    aa=True applies the Mip-Splatting anti-alias opacity compensation (recipe gap #3): scale each
+    opacity by sqrt(det(Σ2D_raw)/det(Σ2D_dilated)) <= 1 so sub-pixel splats shrink (autograd-correct)."""
     Rv, tv, fx, fy, cx, cy = cam[:6]
     u, v, zc, (ca, cb, cc) = project_general(P, Rv, tv, fx, fy, cx, cy)
     cam_center = -Rv.T @ tv                                   # world camera position
@@ -71,6 +73,12 @@ def render(P, cam, H, W, PX, PY):
     order = torch.argsort(zc).tolist()
     C = torch.zeros(H, W, 3, dtype=torch.float64); T = torch.ones(H, W, dtype=torch.float64)
     op = torch.sigmoid(P["op"])
+    if aa:                                                    # conic = Σ2D_dilatedᐨ¹ -> recover raw det
+        detc = ca * cc - cb * cb
+        A = cc / detc; Bb = -cb / detc; Cc = ca / detc       # dilated 2D covariance entries
+        det_dil = A * Cc - Bb * Bb
+        det_raw = (A - 0.3) * (Cc - 0.3) - Bb * Bb
+        op = op * torch.sqrt((det_raw / (det_dil + 1e-12)).clamp(0.0, 1.0))
     for i in order:
         if zc[i] <= 0: continue
         dx, dy = PX - u[i], PY - v[i]

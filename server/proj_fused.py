@@ -164,7 +164,7 @@ def color_backward_fused(dev, P, up, AC, deg):
         if torch.is_tensor(t): return t.detach().cpu().numpy()
         return np.asarray(t)
     g = lambda t: ttnn.to_torch(t).flatten().numpy()[:N].astype(np.float64)
-    shn = _tonp(P["sh"]).reshape(N, K, 3).astype(np.float64)
+    shn = _tonp(P["sh"]).reshape(N, -1, 3)[:, :K, :].astype(np.float64)   # first K=(deg+1)^2 bands (SH-warmup safe)
     opl = _tonp(P["op"]).flatten()[:N]
     op_sig = 1.0 / (1.0 + np.exp(-opl))                                  # sigmoid host-side (no device read)
     up_np = {k: (g(up[k]) if isinstance(up[k], ttnn.Tensor) else np.asarray(up[k], np.float64)) for k in up}

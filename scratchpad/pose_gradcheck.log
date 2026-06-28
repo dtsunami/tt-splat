@@ -1,0 +1,6 @@
+component:   [   dωx       dωy       dωz       dtx       dty       dtz ]
+analytic : [ 0.003874  0.029057  0.005860  0.016341 -0.001483  0.025324]
+finite-d : [ 0.003874  0.029057  0.005860  0.016341 -0.001483  0.025324]
+rel err  : [5.749e-09 7.911e-11 1.506e-09 3.333e-10 1.645e-09 8.557e-11]
+RESULT max_rel_err=5.75e-09
+RESULT POSE_GRADCHECK_OK

@@ -115,9 +115,9 @@ row should be green before you train. `ttgs setup` prints the full dependency gu
 
 **Bring your own capture** (COLMAP via `ttgs sfm`, or the pathclear helper):
 ```bash
-ttgs extract clip.mp4 --output runs/scene/frames     # video → frames (needs ffmpeg)
-ttgs sfm runs/scene/frames --output runs/scene        # frames → COLMAP poses + sparse points (COLMAP, or the bundled pycolmap — no system install)
-ttgs blackhole runs/scene
+ttgs extract clip.mp4 --output work/scene/frames     # video → frames (needs ffmpeg)
+ttgs sfm work/scene/frames --output work/scene        # frames → COLMAP poses + sparse points (COLMAP, or the bundled pycolmap — no system install)
+ttgs blackhole work/scene
 ```
 
 ### Under the hood / advanced

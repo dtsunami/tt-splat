@@ -144,6 +144,16 @@ def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None)
         gop, gsh_t, gmean_color = _color_op_backward(
             B, lambda k, c: _shcol(dev, sh, k, c), U, AC, op_sig, deg)
 
+    # progressive-SH warmup (recipe gap #2): the color backward ran at the EFFECTIVE degree `deg`, so it
+    # only produced grads for the first (deg+1)^2 bands. Pad the inactive high bands with ZERO grad (full
+    # [N,K,3] out, Adam leaves the frozen bands untouched) so the resident loop can ramp deg 0->K.
+    K_eff = (deg + 1) ** 2
+    if K_eff < K:
+        zero = m(gop, 0.0)
+        for k in range(K_eff, K):
+            for c in range(3):
+                gsh_t[(k, c)] = zero
+
     # ===== (3) conic -> Sig2 (a_,b_,c_) =====
     a_, b_, c_, di = A["a_"], A["b_"], A["c_"], A["di"]
     di2 = m(di, di)

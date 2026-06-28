@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tt-splat — the on-device 3DGS training loop, animated 🫧</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --panel2:#11161d; --ink:#e6edf3; --dim:#9aa7b4;
+    --line:#2a3340; --wire:#1d2530;
+    --B:#4af; --bin:#7c9cff; --raster:#4f8; --loss:#ffd166; --A:#f84; --D:#a6f; --C:#0cf;
+    --host:#556; --gddr:#3fd0ff;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:18px 22px 4px; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  .sub { color:var(--dim); max-width:1040px; }
+  .sub b { color:var(--ink); }
+  code { background:#0a0d12; padding:1px 6px; border-radius:5px; color:#cde8ff; font-size:.92em; }
+
+  .bar-top { display:flex; align-items:center; gap:14px; flex-wrap:wrap; padding:6px 22px 10px; }
+  .pill { display:inline-flex; align-items:center; gap:8px; padding:5px 14px; border-radius:20px;
+          font-size:13px; border:1px solid var(--line); color:var(--dim); cursor:pointer;
+          user-select:none; transition:border-color .15s,color .15s,background .15s; }
+  .pill:hover { border-color:#666; }
+  .pill .led { width:9px; height:9px; border-radius:50%; background:#444; box-shadow:0 0 0 2px #222; }
+  .pill.demo { border-color:#4af; color:#7cf; background:#10203a; }
+  .pill.demo .led { background:#4af; box-shadow:0 0 8px #4af; }
+  .pill.live { border-color:#4f4; color:#8f8; background:#0f2410; }
+  .pill.live .led { background:#4f4; box-shadow:0 0 8px #4f4; animation:blink 1s infinite; }
+  .pill.err { border-color:#f55; color:#f88; background:#241010; }
+  .pill.err .led { background:#f55; box-shadow:0 0 8px #f55; }
+  @keyframes blink { 50% { opacity:.45; } }
+  button.tog { background:#21304a; color:var(--ink); border:1px solid #34507a; border-radius:8px;
+               padding:6px 14px; cursor:pointer; font-size:13px; font-family:inherit; }
+  button.tog:hover { background:#2b3f60; }
+  button.tog.on { background:#1d6fd0; border-color:#3a8de8; color:#fff; }
+  .status-note { color:var(--dim); font-size:12.5px; }
+
+  .stagewrap { padding:6px 22px 4px; }
+  .scene { background:#0a0d12; border:1px solid var(--line); border-radius:12px; display:block;
+           width:100%; max-width:1280px; }
+
+  .grids { display:grid; grid-template-columns:1.45fr 1fr; gap:16px; padding:10px 22px 22px;
+           max-width:1320px; }
+  @media (max-width:1000px){ .grids { grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:11px; padding:14px 16px; }
+  .card h2 { margin:0 0 10px; font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); }
+
+  /* timing breakdown */
+  .trow { display:flex; align-items:center; gap:10px; margin:6px 0; }
+  .trow .tk { width:118px; display:flex; align-items:center; gap:7px; font-size:13px; }
+  .trow .tk .sw { width:11px; height:11px; border-radius:3px; flex-shrink:0; }
+  .trow .tk b { color:var(--ink); }
+  .trow .tk span { color:var(--dim); font-size:12px; }
+  .tbar { flex:1; height:15px; background:#0a0d12; border-radius:5px; overflow:hidden; position:relative; }
+  .tbar > i { position:absolute; left:0; top:0; bottom:0; display:block; border-radius:5px;
+              transition:width .35s ease; }
+  .tnum { width:72px; text-align:right; font-variant-numeric:tabular-nums; font-size:13px; color:var(--ink); }
+  .trow.boss .tnum { color:#fff; font-weight:bold; }
+  .trow.boss .tk b::after { content:' ◀ bottleneck'; color:#f84; font-size:10px; font-weight:normal; }
+
+  /* metric tiles */
+  .metrics { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; }
+  .metric { background:var(--panel2); border:1px solid var(--line); border-radius:9px; padding:9px 12px; }
+  .metric .ml { font-size:10px; text-transform:uppercase; letter-spacing:.06em; color:#7d8a98; }
+  .metric .mv { font-size:21px; font-weight:bold; color:#fff; line-height:1.25; font-variant-numeric:tabular-nums; }
+  .metric .mv small { font-size:12px; color:var(--dim); font-weight:normal; }
+  .metric.accent .mv { color:#7cf; }
+
+  .legend { color:var(--dim); font-size:13px; padding:0 22px 28px; max-width:1180px; line-height:1.6; }
+  .legend b { color:var(--ink); }
+  .legend .chip { display:inline-block; padding:1px 7px; border-radius:6px; font-size:12px;
+                  margin-right:2px; font-weight:bold; }
+  .legend ul { margin:6px 0 0; padding-left:18px; }
+  .legend li { margin:2px 0; }
+  .foot { color:#6c7785; font-size:12px; padding:0 22px 26px; max-width:1180px; }
+  .foot a { color:var(--B); text-decoration:none; }
+  .foot a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+<header>
+  <h1>tt-splat: the on-device 3DGS training loop 🫧🎢</h1>
+  <div class="sub">One training step is a <b>round trip</b> on the Blackhole. Fuzzy 3D <b>Gaussians</b> live in
+  <b>GDDR/L1</b> and stream through a grid of <b>Tensix cores</b>: project to 2D, bin into screen tiles, alpha-blend
+  to an image, measure the error, then push every blob a little less wrong — and the optimizer
+  <b>never leaves the card</b>. Seven stages, looping <code>C → B</code> on resident params.</div>
+</header>
+
+<div class="bar-top">
+  <span id="modePill" class="pill demo" title="Click to toggle DEMO ↔ LIVE">
+    <span class="led"></span><span id="modeText">DEMO</span>
+  </span>
+  <button id="liveBtn" class="tog" title="Poll GET /state every ~500 ms and drive the animation from real telemetry. Falls back to DEMO if /state returns 204 or the fetch fails.">Try LIVE (poll /state)</button>
+  <button id="pauseBtn" class="tog" title="Freeze / resume the data clock (particles keep flowing).">⏸ Pause</button>
+  <span id="statusNote" class="status-note">offline demo — synthetic timings that evolve like a real run</span>
+</div>
+
+<div class="stagewrap">
+  <canvas id="scene" class="scene" width="1280" height="430"></canvas>
+</div>
+
+<div class="grids">
+  <div class="card">
+    <h2>Per-stage wall time · ms <span id="totBadge" style="color:#7cf;float:right;font-variant-numeric:tabular-nums"></span></h2>
+    <div id="timing"></div>
+  </div>
+  <div class="card">
+    <h2>Live training metrics</h2>
+    <div class="metrics">
+      <div class="metric accent"><div class="ml">step</div><div class="mv"><span id="m-step">—</span><small id="m-total"></small></div></div>
+      <div class="metric"><div class="ml">loss · MSE</div><div class="mv" id="m-loss">—</div></div>
+      <div class="metric"><div class="ml">PSNR (db)</div><div class="mv" id="m-psnr">—</div></div>
+      <div class="metric"><div class="ml">L1</div><div class="mv" id="m-l1">—</div></div>
+      <div class="metric"><div class="ml">gaussians</div><div class="mv" id="m-ng">—</div></div>
+      <div class="metric"><div class="ml">step time</div><div class="mv" id="m-stepms">—<small> ms</small></div></div>
+    </div>
+    <h2 style="margin-top:14px">loss ↓ · PSNR ↑ history</h2>
+    <canvas id="chart" width="560" height="120" style="width:100%;background:#0a0d12;border:1px solid var(--line);border-radius:8px"></canvas>
+    <div style="display:flex;gap:16px;margin-top:6px;font-size:12px;color:var(--dim)">
+      <span><span style="color:#ffd166">━</span> loss (MSE)</span>
+      <span><span style="color:#4f8">━</span> PSNR (dB)</span>
+    </div>
+  </div>
+</div>
+
+<div class="legend">
+  <b>The seven stages</b> (the colored bar above maps 1:1 to the training page):
+  <ul>
+    <li><span class="chip" style="background:#10203a;color:#4af">B · project fwd</span> <b>device</b> — batched ttnn over N: <code>mean@R+t</code>, conic, SH→color, sigmoid opacity. 3D blobs → 2D ellipses.</li>
+    <li><span class="chip" style="background:#1a2240;color:#7c9cff">bin · tile + sort</span> <b>host glue</b> — 3-sigma AABB → per-Tensix-tile gaussian lists, sorted front-to-back by depth.</li>
+    <li><span class="chip" style="background:#0f2418;color:#4f8">raster · blend</span> <b>device (M14)</b> — per Tensix <b>core</b>, front→back alpha-blend on the <b>SFPU</b>; outputs image + final transmittance T.</li>
+    <li><span class="chip" style="background:#2a2410;color:#ffd166">loss</span> <b>host</b> — MSE + <code>dL/dimage</code>, masked, elementwise.</li>
+    <li><span class="chip" style="background:#2a1810;color:#f84">A · raster bwd</span> <b>device</b> — one grid dispatch, all tiles in parallel; per-pixel gradient products. Historically the bottleneck.</li>
+    <li><span class="chip" style="background:#1d1430;color:#a6f">D · project bwd</span> <b>device</b> — analytic: conic→Σ2D→scale/quat, uv→mean, color→SH, op→logit. Dominant on real data.</li>
+    <li><span class="chip" style="background:#06222a;color:#0cf">C · Adam</span> <b>device</b> — resident param update over N; params + momentum stay on the card, then loop back to B.</li>
+  </ul>
+  The grey <b>host glue</b> sliver = <code>bin</code> (the UI also folds in <code>loss</code>, but <code>loss</code> isn't emitted, so it's effectively bin only).
+  Everything colored runs on the Blackhole. Watch the bar: each time we speed up the tallest stage, a different one becomes the bottleneck.
+</div>
+
+<div class="foot">
+  Self-contained — open this file directly or view it at
+  <a href="/docs/algorithm_anim.html"><code>http://localhost:7860/docs/algorithm_anim.html</code></a>.
+  <b>LIVE</b> mode polls same-origin <code>GET /state</code> every 500 ms and reads
+  <code>stage_timings.{B,bin,raster,A,D,C,step}</code>, <code>step</code>, <code>total_steps</code>, <code>loss</code>,
+  <code>ssim</code> (PSNR), <code>l1</code>, <code>n_gaussians</code>. No external requests; falls back to DEMO on 204 / error.
+  Companion cartoons: <a href="/docs/pipeline_cartoon.html">pipeline</a> · <a href="/docs/adam_cartoon.html">Adam</a>.
+</div>
+
+<script>
+"use strict";
+// ───────────────────────── stage model ─────────────────────────
+const STAGES = [
+  {k:'B',      label:'B',      name:'project fwd',  color:'#4af',    on:'device', where:'project'},
+  {k:'bin',    label:'bin',    name:'tile + sort',  color:'#7c9cff', on:'host',   where:'bins'},
+  {k:'raster', label:'raster', name:'blend',        color:'#4f8',    on:'device', where:'grid'},
+  {k:'loss',   label:'loss',   name:'MSE + dL',     color:'#ffd166', on:'host',   where:'image'},
+  {k:'A',      label:'A',      name:'raster bwd',   color:'#f84',    on:'device', where:'grid'},
+  {k:'D',      label:'D',      name:'project bwd',  color:'#a6f',    on:'device', where:'project'},
+  {k:'C',      label:'C',      name:'Adam',         color:'#0cf',    on:'device', where:'gddr'},
+];
+const KORD = STAGES.map(s=>s.k);
+const COL  = Object.fromEntries(STAGES.map(s=>[s.k,s.color]));
+
+// ───────────────────────── state ─────────────────────────
+let MODE = 'DEMO';          // 'DEMO' | 'LIVE'
+let liveWanted = false;     // user asked for LIVE
+let paused = false;
+let active = 0;             // index of currently-pulsing stage (drives the token + grid)
+let stagePhase = 0;         // 0..1 progress within the active stage
+const data = {              // the numbers shown everywhere
+  step:0, total:0, loss:0, psnr:0, l1:0, ng:0, stepms:0,
+  t:{B:0,bin:0,raster:0,A:0,D:0,C:0},
+};
+const hist = [];            // {loss, psnr}
+const HMAX = 90;
+
+// ───────────────────────── DEMO data generator ─────────────────────────
+// realistic shape: A & D dominate, host bin/loss small; loss decays, PSNR climbs,
+// occasional bottleneck shift between A and D.
+let demoStep = 0;
+const demoBase = { B:6.0, bin:2.4, raster:9.5, loss:1.1, A:21.0, D:14.5, C:3.2 };
+let bottleShift = 0; // slowly oscillates which of A/D dominates
+function demoTick(){
+  demoStep++;
+  bottleShift += 0.06;
+  const jit = (m)=> m*(0.85 + Math.random()*0.30);
+  // slow drift so the bottleneck flips between A (early) and D (later/real data)
+  const aMul = 1.0 + 0.55*Math.sin(bottleShift)*Math.sin(bottleShift);
+  const dMul = 1.0 + 0.55*Math.cos(bottleShift)*Math.cos(bottleShift);
+  const t = {
+    B:jit(demoBase.B), bin:jit(demoBase.bin), raster:jit(demoBase.raster),
+    loss:jit(demoBase.loss), A:jit(demoBase.A*aMul), D:jit(demoBase.D*dMul), C:jit(demoBase.C),
+  };
+  const stepms = KORD.reduce((a,k)=>a+t[k],0) * (1.0 + Math.random()*0.04);
+  // metrics: exponential-ish loss decay + PSNR climb with noise
+  const p = demoStep;
+  const loss = 0.16*Math.exp(-p/140) + 0.004 + (Math.random()-0.5)*0.0016;
+  const l1   = 0.30*Math.exp(-p/150) + 0.012 + (Math.random()-0.5)*0.003;
+  const psnr = 12 + 18*(1-Math.exp(-p/170)) + (Math.random()-0.5)*0.5;
+  apply({
+    step:demoStep, total:3000, loss:Math.max(loss,0.0005), l1:Math.max(l1,0.004),
+    psnr, ng:118000, t, stepms,
+  });
+}
+
+// ───────────────────────── LIVE poll ─────────────────────────
+let lastLiveStep = -1, liveFailStreak = 0;
+async function livePoll(){
+  if (!liveWanted) return;
+  try {
+    const r = await fetch('/state', {cache:'no-store'});
+    if (r.status === 204) { fallback('no step pushed yet (/state 204)'); return; }
+    if (!r.ok) { fallback('/state '+r.status); return; }
+    const j = await r.json();
+    const st = j.stage_timings;
+    if (!st) { fallback('host path — no stage_timings'); return; }
+    liveFailStreak = 0;
+    setMode('LIVE','LIVE — polling /state · device-resident stage_timings');
+    const t = {
+      B:+st.B||0, bin:+st.bin||0, raster:+st.raster||0,
+      A:+st.A||0, D:+st.D||0, C:+st.C||0,
+    };
+    apply({
+      step:+j.step||0, total:+j.total_steps||0,
+      loss:+j.loss||0, l1:+j.l1||0, psnr:+j.ssim||0,   // ssim field is actually PSNR (dB)
+      ng:+j.n_gaussians||0, t, stepms:+st.step||KORD.reduce((a,k)=>a+t[k],0),
+    }, (j.step !== lastLiveStep));
+    lastLiveStep = j.step;
+  } catch(e) { fallback('fetch failed'); }
+}
+function fallback(why){
+  liveFailStreak++;
+  // tolerate a transient miss; only drop to demo after a couple of failures
+  if (MODE==='LIVE' && liveFailStreak<=2) { setMode('LIVE','LIVE — '+why+' (retrying)'); return; }
+  setMode('DEMO','DEMO — '+why+' → synthetic timings');
+}
+
+// ───────────────────────── apply a data sample ─────────────────────────
+function apply(s, isNewStep=true){
+  data.step=s.step; data.total=s.total; data.loss=s.loss; data.psnr=s.psnr;
+  data.l1=s.l1; data.ng=s.ng; data.stepms=s.stepms; data.t=s.t;
+  if (isNewStep){
+    hist.push({loss:s.loss, psnr:s.psnr});
+    if (hist.length>HMAX) hist.shift();
+    // emit a fresh burst of particles for the new step
+    spawnBurst();
+  }
+  renderTiming(); renderMetrics(); renderChart();
+}
+
+// ───────────────────────── mode helpers ─────────────────────────
+const modePill=document.getElementById('modePill'), modeText=document.getElementById('modeText'),
+      statusNote=document.getElementById('statusNote'), liveBtn=document.getElementById('liveBtn');
+function setMode(m, note){
+  MODE=m;
+  modeText.textContent=m;
+  modePill.className='pill '+(m==='LIVE'?'live':'demo');
+  if (note) statusNote.textContent=note;
+}
+modePill.onclick = ()=>{ liveWanted=!liveWanted; liveBtn.classList.toggle('on',liveWanted);
+  if(!liveWanted){ setMode('DEMO','offline demo — synthetic timings that evolve'); } else { setMode('DEMO','LIVE requested — waiting for /state…'); livePoll(); } };
+liveBtn.onclick = modePill.onclick;
+document.getElementById('pauseBtn').onclick = (e)=>{ paused=!paused;
+  e.target.classList.toggle('on',paused); e.target.textContent = paused?'▶ Resume':'⏸ Pause'; };
+
+// ───────────────────────── timing panel ─────────────────────────
+const timingEl=document.getElementById('timing'), totBadge=document.getElementById('totBadge');
+function buildTimingRows(){
+  timingEl.innerHTML = STAGES.map(s=>`
+    <div class="trow" data-k="${s.k}">
+      <span class="tk"><span class="sw" style="background:${s.color}"></span><b>${s.label}</b><span>${s.on}</span></span>
+      <span class="tbar"><i style="background:${s.color}"></i></span>
+      <span class="tnum">0.0</span>
+    </div>`).join('');
+}
+function renderTiming(){
+  const t=data.t;
+  const max = Math.max(0.001, ...KORD.map(k=>t[k]||0));
+  let boss=KORD[0], bv=-1;
+  for(const k of KORD){ if((t[k]||0)>bv){bv=t[k]||0; boss=k;} }
+  for(const row of timingEl.children){
+    const k=row.dataset.k, v=t[k]||0;
+    row.querySelector('i').style.width = (100*v/max)+'%';
+    row.querySelector('.tnum').textContent = v.toFixed(1);
+    row.classList.toggle('boss', k===boss);
+  }
+  totBadge.textContent = 'Σ step ' + (data.stepms||0).toFixed(1) + ' ms';
+}
+
+// ───────────────────────── metric tiles + chart ─────────────────────────
+const $=id=>document.getElementById(id);
+function fmtN(n){ return n>=1000 ? (n/1000).toFixed(n>=100000?0:1)+'k' : ''+n; }
+function renderMetrics(){
+  $('m-step').textContent = data.step||'—';
+  $('m-total').textContent = data.total? ' / '+data.total : '';
+  $('m-loss').textContent = data.loss? data.loss.toFixed(5):'—';
+  $('m-psnr').textContent = data.psnr? data.psnr.toFixed(2):'—';
+  $('m-l1').textContent = data.l1? data.l1.toFixed(4):'—';
+  $('m-ng').textContent = data.ng? fmtN(data.ng):'—';
+  $('m-stepms').innerHTML = (data.stepms?data.stepms.toFixed(1):'—')+'<small> ms</small>';
+}
+const chart=document.getElementById('chart'), cctx=chart.getContext('2d');
+function renderChart(){
+  const W=chart.width,H=chart.height; cctx.clearRect(0,0,W,H);
+  if(hist.length<2) return;
+  const losses=hist.map(h=>h.loss), psnrs=hist.map(h=>h.psnr);
+  const lmax=Math.max(...losses), lmin=Math.min(...losses);
+  const pmax=Math.max(...psnrs), pmin=Math.min(...psnrs);
+  // grid
+  cctx.strokeStyle='rgba(255,255,255,0.05)'; cctx.lineWidth=1;
+  for(let g=1;g<4;g++){ const y=H*g/4; cctx.beginPath(); cctx.moveTo(0,y); cctx.lineTo(W,y); cctx.stroke(); }
+  const line=(arr,mn,mx,color)=>{
+    const rng=(mx-mn)||1; cctx.strokeStyle=color; cctx.lineWidth=2; cctx.beginPath();
+    arr.forEach((v,i)=>{ const x=i/(arr.length-1)*W, y=H-8-((v-mn)/rng)*(H-16);
+      i?cctx.lineTo(x,y):cctx.moveTo(x,y); }); cctx.stroke();
+  };
+  line(losses,lmin,lmax,'#ffd166');
+  line(psnrs,pmin,pmax,'#4f8');
+}
+
+// ════════════════════════ CANVAS SCENE ════════════════════════
+const scene=document.getElementById('scene'), x=scene.getContext('2d');
+const SW=scene.width, SH=scene.height;
+
+// layout (logical coords; canvas is fixed-size, CSS scales it)
+const PIPE_Y = 64;                       // pipeline node row
+const NODE_X = [];                        // filled below
+(function(){ const n=STAGES.length, m=70, span=SW-2*m;
+  for(let i=0;i<n;i++) NODE_X.push(m + span*i/(n-1)); })();
+
+// stations (visual zones for the streaming data)
+const GDDR = {x:130, y:300, w:150, h:96};                 // resident param reservoir
+const PROJ = {x:330, y:270, w:120, h:120};                // projection lens
+const BINS = {x:500, y:262, w:120, h:140};                // tile bins
+const GRID = {x:680, y:240, w:200, h:170, n:8};           // 8x8 Tensix grid
+const KSFPU= {x:910, y:262, w:150, h:64};                 // SFPU blend kernel
+const KMTX = {x:910, y:346, w:150, h:60};                 // matrix-engine reduce kernel
+
+// ── particles ──
+const parts=[];        // streaming gaussians
+const MAXP=260;
+function spawnBurst(){
+  // tie burst size loosely to data so LIVE/DEMO both look alive
+  const n = 26 + (MODE==='LIVE'?10:0);
+  for(let i=0;i<n && parts.length<MAXP;i++){
+    parts.push(makePart());
+  }
+}
+function makePart(){
+  // start inside the GDDR reservoir
+  return {
+    seg:'spawn', u:Math.random()*0.2, life:0,
+    sx:GDDR.x+12+Math.random()*(GDDR.w-24), sy:GDDR.y+12+Math.random()*(GDDR.h-24),
+    px:0, py:0, hue:Math.random(), r:1.6+Math.random()*1.8,
+    tile: (Math.random()*GRID.n|0) + (Math.random()*GRID.n|0)*GRID.n,
+    speed:0.004+Math.random()*0.004,
+  };
+}
+// route a particle through the pipeline zones based on the active stage family
+// path: GDDR → PROJ(B) → BINS(bin) → GRID(raster) → KSFPU/KMTX → back GRID(A) → PROJ(D) → GDDR(C)
+function gcell(idx){
+  const c=idx%GRID.n, r=(idx/GRID.n|0), cw=GRID.w/GRID.n, ch=GRID.h/GRID.n;
+  return {x:GRID.x+cw*(c+0.5), y:GRID.y+ch*(r+0.5)};
+}
+function ease(u){ return u<.5?2*u*u:1-Math.pow(-2*u+2,2)/2; }
+
+function stepParts(dt){
+  for(let i=parts.length-1;i>=0;i--){
+    const p=parts[i]; p.life+=dt;
+    p.u += p.speed*dt*(paused?0.35:1);   // keep gentle flow even when data-paused
+    if(p.u>=1){ p.u=0; advance(p); }
+    locate(p);
+  }
+  // cull excess slowly
+  while(parts.length>MAXP) parts.shift();
+}
+function advance(p){
+  const order=['spawn','proj','bins','grid','sfpu','gridB','projD','home'];
+  const i=order.indexOf(p.seg);
+  if(i<0||i>=order.length-1){ // recycle from reservoir
+    Object.assign(p, makePart()); return;
+  }
+  p.seg=order[i+1];
+  if(p.seg==='home'){ /* lands back into GDDR; next advance recycles */ }
+}
+function locate(p){
+  const u=ease(p.u);
+  const lerp=(a,b)=>a+(b-a)*u;
+  let from, to;
+  switch(p.seg){
+    case 'spawn': // drift inside reservoir then aim at projection mouth
+      p.px=p.sx; p.py=p.sy; return;
+    case 'proj':  from=[centerOut(GDDR,'r')[0],GDDR.y+GDDR.h/2]; to=[PROJ.x,PROJ.y+PROJ.h/2]; break;
+    case 'bins':  from=[PROJ.x+PROJ.w,PROJ.y+PROJ.h/2]; to=[BINS.x, BINS.y + binSlot(p)]; break;
+    case 'grid':  from=[BINS.x+BINS.w,BINS.y+binSlot(p)]; { const g=gcell(p.tile); to=[g.x,g.y]; } break;
+    case 'sfpu':  { const g=gcell(p.tile); from=[g.x,g.y];
+                    to = (p.tile%2) ? [KSFPU.x,KSFPU.y+KSFPU.h/2] : [KMTX.x,KMTX.y+KMTX.h/2]; } break;
+    case 'gridB': { const k=(p.tile%2)?KSFPU:KMTX; from=[k.x,k.y+k.h/2]; const g=gcell(p.tile); to=[g.x,g.y]; } break;
+    case 'projD': { const g=gcell(p.tile); from=[g.x,g.y]; to=[PROJ.x+PROJ.w,PROJ.y+PROJ.h/2]; } break;
+    case 'home':  from=[PROJ.x,PROJ.y+PROJ.h/2]; to=[GDDR.x+GDDR.w/2,GDDR.y+GDDR.h/2]; break;
+    default: p.px=p.sx; p.py=p.sy; return;
+  }
+  p.px=lerp(from[0],to[0]); p.py=lerp(from[1],to[1]);
+}
+function binSlot(p){ return 14 + (p.tile % 8) * (BINS.h-28)/7; }
+function centerOut(z,side){ return side==='r'?[z.x+z.w, z.y+z.h/2]:[z.x,z.y+z.h/2]; }
+
+// map active pipeline stage -> which zones glow
+function zonesForStage(k){
+  switch(k){
+    case 'B':      return {proj:1};
+    case 'bin':    return {bins:1};
+    case 'raster': return {grid:1, sfpu:1};
+    case 'loss':   return {image:1};
+    case 'A':      return {grid:1, mtx:1};
+    case 'D':      return {proj:1};
+    case 'C':      return {gddr:1};
+    default: return {};
+  }
+}
+
+// ── drawing helpers ──
+function rrect(c,a,b,w,h,r){ c.beginPath(); c.moveTo(a+r,b); c.arcTo(a+w,b,a+w,b+h,r);
+  c.arcTo(a+w,b+h,a,b+h,r); c.arcTo(a,b+h,a,b,r); c.arcTo(a,b,a+w,b,r); c.closePath(); }
+function glow(c,col,blur,fn){ c.save(); c.shadowColor=col; c.shadowBlur=blur; fn(); c.restore(); }
+function hsl(h,s,l,a){ return `hsla(${h*360|0},${s}%,${l}%,${a})`; }
+
+// ── pipeline ribbon at top ──
+function drawPipeline(){
+  // wire
+  x.strokeStyle='#1d2530'; x.lineWidth=3;
+  x.beginPath(); x.moveTo(NODE_X[0],PIPE_Y); x.lineTo(NODE_X[NODE_X.length-1],PIPE_Y); x.stroke();
+  // loop arrow C -> B (resident params)
+  const cX=NODE_X[NODE_X.length-1], bX=NODE_X[0], topY=PIPE_Y-40;
+  x.strokeStyle='#0cf'; x.lineWidth=2; x.setLineDash([5,4]);
+  x.beginPath(); x.moveTo(cX,PIPE_Y-14);
+  x.bezierCurveTo(cX,topY-6, bX,topY-6, bX,PIPE_Y-14); x.stroke(); x.setLineDash([]);
+  // arrowhead into B
+  x.fillStyle='#0cf'; x.beginPath(); x.moveTo(bX,PIPE_Y-14);
+  x.lineTo(bX-5,PIPE_Y-24); x.lineTo(bX+5,PIPE_Y-24); x.closePath(); x.fill();
+  x.fillStyle='#5b7'; x.font='11px sans-serif'; x.textAlign='center';
+  x.fillText('resident params loop  C → B', (cX+bX)/2, topY-10);
+
+  // token flowing along active arrow
+  const tokX = NODE_X[active] + (NODE_X[Math.min(active+1,NODE_X.length-1)]-NODE_X[active])*stagePhase;
+  glow(x,'#fff',10,()=>{ x.fillStyle='#fff'; x.beginPath(); x.arc(tokX,PIPE_Y,4,0,7); x.fill(); });
+
+  // nodes
+  STAGES.forEach((s,i)=>{
+    const nx=NODE_X[i], isA=(i===active);
+    const pr = isA ? 13 + 2.5*Math.sin(perf()/120) : 11;
+    if(isA) glow(x,s.color,16,()=>{ x.fillStyle=s.color; x.beginPath(); x.arc(nx,PIPE_Y,pr,0,7); x.fill(); });
+    else { x.fillStyle=s.color; x.globalAlpha=0.85; x.beginPath(); x.arc(nx,PIPE_Y,pr,0,7); x.fill(); x.globalAlpha=1; }
+    // ring for active
+    if(isA){ x.strokeStyle=s.color; x.lineWidth=2; x.beginPath(); x.arc(nx,PIPE_Y,pr+5,0,7); x.stroke(); }
+    x.fillStyle='#0a0d12'; x.font='bold 11px monospace'; x.textAlign='center';
+    x.fillText(s.label==='raster'?'R':(s.label.length>3?s.label[0]:s.label), nx, PIPE_Y+4);
+    x.fillStyle = isA? s.color : '#8a97a6'; x.font='11px sans-serif';
+    x.fillText(s.label, nx, PIPE_Y+30);
+    x.fillStyle='#5a6573'; x.font='9px sans-serif';
+    x.fillText(s.on, nx, PIPE_Y+42);
+  });
+}
+
+// ── data plane (reservoir / lens / bins / grid / kernels) ──
+function drawStation(zone, label, baseCol, hot){
+  const a=hot?1:0.32;
+  if(hot) glow(x,baseCol,18,()=>{ x.fillStyle='rgba(20,28,38,0.9)'; rrect(x,zone.x,zone.y,zone.w,zone.h,10); x.fill(); });
+  else { x.fillStyle='rgba(18,24,32,0.85)'; rrect(x,zone.x,zone.y,zone.w,zone.h,10); x.fill(); }
+  x.strokeStyle = hot? baseCol : '#283242'; x.lineWidth = hot?2:1.2;
+  rrect(x,zone.x,zone.y,zone.w,zone.h,10); x.stroke();
+  x.fillStyle = hot? baseCol : '#7c8a99'; x.font='bold 11px sans-serif'; x.textAlign='left';
+  x.fillText(label, zone.x+10, zone.y+16);
+}
+
+function drawDataPlane(){
+  const za = zonesForStage(STAGES[active].k);
+
+  // GDDR reservoir
+  drawStation(GDDR,'🫧 GDDR · resident params','#3fd0ff', !!za.gddr);
+  // little param swatches inside
+  x.font='9px monospace'; x.textAlign='left';
+  ['mean','scale','quat','sh','op'].forEach((p,i)=>{
+    x.fillStyle = za.gddr ? '#0cf' : '#3a4756';
+    x.fillText('▣ '+p, GDDR.x+12+(i%3)*46, GDDR.y+38+((i/3|0))*16);
+  });
+
+  // Projection lens
+  drawStation(PROJ,'B / D · projection','#4af', !!za.proj);
+  // lens glyph
+  x.strokeStyle = za.proj? (STAGES[active].k==='D'?'#a6f':'#4af') : '#34507a'; x.lineWidth=2;
+  x.beginPath(); x.ellipse(PROJ.x+PROJ.w/2,PROJ.y+PROJ.h/2,22,40,0,0,7); x.stroke();
+  x.beginPath(); x.ellipse(PROJ.x+PROJ.w/2,PROJ.y+PROJ.h/2,11,40,0,0,7); x.stroke();
+  x.fillStyle='#5a6573'; x.font='9px sans-serif'; x.textAlign='center';
+  x.fillText('3D → 2D', PROJ.x+PROJ.w/2, PROJ.y+PROJ.h-8);
+
+  // Tile bins
+  drawStation(BINS,'bin · tile + depth sort','#7c9cff', !!za.bins);
+  for(let s=0;s<8;s++){ const y=BINS.y+12+s*(BINS.h-24)/8;
+    x.strokeStyle = za.bins? 'rgba(124,156,255,0.5)':'#283242'; x.lineWidth=1;
+    x.beginPath(); x.moveTo(BINS.x+8,y); x.lineTo(BINS.x+BINS.w-8,y); x.stroke(); }
+
+  // Tensix grid
+  const gk = STAGES[active].k;
+  const gridHot = !!za.grid;
+  drawStation(GRID, gridHot ? (gk==='A'?'Tensix grid · A bwd':'Tensix grid · raster') : 'Tensix core grid','#4f8', gridHot);
+  drawGridCells(gridHot, gk);
+
+  // kernels
+  const sfpuHot = !!za.sfpu, mtxHot = !!za.mtx;
+  drawKernel(KSFPU,'SFPU · alpha-blend','#4f8', sfpuHot, 'blend');
+  drawKernel(KMTX, 'matrix-eng · reduce','#f84', mtxHot, 'reduce');
+
+  // image target (loss stage)
+  if(za.image){
+    x.save(); x.globalAlpha=0.9;
+    glow(x,'#ffd166',16,()=>{ x.fillStyle='rgba(40,36,18,0.85)'; rrect(x,KSFPU.x,KSFPU.y,KSFPU.w,KMTX.y+KMTX.h-KSFPU.y,10); x.fill(); });
+    x.strokeStyle='#ffd166'; x.lineWidth=2; rrect(x,KSFPU.x,KSFPU.y,KSFPU.w,KMTX.y+KMTX.h-KSFPU.y,10); x.stroke();
+    x.fillStyle='#ffd166'; x.font='bold 11px sans-serif'; x.textAlign='center';
+    x.fillText('loss · MSE + dL/dimage', KSFPU.x+KSFPU.w/2, (KSFPU.y+KMTX.y+KMTX.h)/2);
+    x.restore();
+  }
+
+  // flow wires between stations
+  drawFlowWires(za);
+}
+
+function drawGridCells(hot, gk){
+  const cw=GRID.w/GRID.n, ch=GRID.h/GRID.n, t=perf();
+  for(let r=0;r<GRID.n;r++) for(let c=0;c<GRID.n;c++){
+    const idx=r*GRID.n+c;
+    // each cell pulses with a phase offset so the grid "ripples" when hot
+    const ph=(t/420 + (r+c)*0.22);
+    const lit = hot ? (0.35 + 0.6*Math.max(0,Math.sin(ph))) : 0.12;
+    const col = gk==='A' ? '#f84' : '#4f8';
+    x.fillStyle = hot ? hexA(col, lit*0.55) : 'rgba(60,72,86,0.18)';
+    const cx=GRID.x+c*cw+1.5, cy=GRID.y+r*ch+1.5;
+    rrect(x,cx,cy,cw-3,ch-3,2); x.fill();
+    if(hot && lit>0.7){ x.strokeStyle=hexA(col,0.8); x.lineWidth=1; rrect(x,cx,cy,cw-3,ch-3,2); x.stroke(); }
+  }
+}
+function drawKernel(z,label,col,hot,kind){
+  if(hot) glow(x,col,16,()=>{ x.fillStyle='rgba(18,26,34,0.92)'; rrect(x,z.x,z.y,z.w,z.h,9); x.fill(); });
+  else { x.fillStyle='rgba(16,22,30,0.8)'; rrect(x,z.x,z.y,z.w,z.h,9); x.fill(); }
+  x.strokeStyle=hot?col:'#283242'; x.lineWidth=hot?2:1.2; rrect(x,z.x,z.y,z.w,z.h,9); x.stroke();
+  x.fillStyle=hot?col:'#7c8a99'; x.font='bold 11px sans-serif'; x.textAlign='left';
+  x.fillText(label, z.x+10, z.y+18);
+  // little engine animation
+  x.textAlign='left'; x.font='10px monospace'; x.fillStyle = hot?col:'#46525f';
+  if(kind==='blend'){
+    const t=perf()/200; for(let i=0;i<5;i++){ const a=hot?(0.4+0.6*Math.abs(Math.sin(t+i*0.7))):0.25;
+      x.fillStyle=hexA(col, a*0.7); x.fillRect(z.x+12+i*22, z.y+32, 16, 16); }
+    x.fillStyle=hot?col:'#46525f'; x.fillText('front→back · T', z.x+10, z.y+z.h-6);
+  } else {
+    // matrix dots
+    for(let r=0;r<3;r++)for(let c=0;c<4;c++){ const a=hot?(0.3+0.6*Math.abs(Math.sin(perf()/250+(r+c)))):0.22;
+      x.fillStyle=hexA(col,a*0.7); x.beginPath(); x.arc(z.x+16+c*16, z.y+32+r*7, 2.4,0,7); x.fill(); }
+    x.fillStyle=hot?col:'#46525f'; x.fillText('Σ grad · 3×3', z.x+74, z.y+z.h-6);
+  }
+}
+function drawFlowWires(za){
+  const w=(a,b,col,on)=>{ x.strokeStyle=on?hexA(col,0.55):'#1a222c'; x.lineWidth=on?2:1.2;
+    x.beginPath(); x.moveTo(a[0],a[1]); x.lineTo(b[0],b[1]); x.stroke(); };
+  const gmid=[GRID.x+GRID.w/2, GRID.y+GRID.h/2];
+  w([GDDR.x+GDDR.w,GDDR.y+GDDR.h/2],[PROJ.x,PROJ.y+PROJ.h/2],'#4af',za.proj);
+  w([PROJ.x+PROJ.w,PROJ.y+PROJ.h/2],[BINS.x,BINS.y+BINS.h/2],'#7c9cff',za.bins);
+  w([BINS.x+BINS.w,BINS.y+BINS.h/2],[GRID.x,gmid[1]],'#4f8',za.grid);
+  w(gmid,[KSFPU.x,KSFPU.y+KSFPU.h/2],'#4f8',za.sfpu);
+  w(gmid,[KMTX.x,KMTX.y+KMTX.h/2],'#f84',za.mtx);
+  // backward loop (D + C) wire from projection back to gddr
+  w([PROJ.x,PROJ.y+PROJ.h/2],[GDDR.x+GDDR.w/2,GDDR.y],'#0cf',za.gddr);
+}
+
+function drawParticles(){
+  for(const p of parts){
+    const onDevice = p.seg!=='spawn' && p.seg!=='bins';
+    // color: forward = blob hue; gradient legs (gridB/projD/home) tint orange/cyan
+    let col;
+    if(p.seg==='gridB'||p.seg==='projD') col = '#f84';
+    else if(p.seg==='home') col = '#0cf';
+    else col = hsl(0.55 + p.hue*0.12, 70, 62, 1);
+    x.fillStyle=col; x.globalAlpha=0.9;
+    x.beginPath(); x.arc(p.px,p.py,p.r,0,7); x.fill();
+  }
+  x.globalAlpha=1;
+}
+
+function hexA(hex,a){
+  // hex like #4f8 or #ff8844
+  let h=hex.replace('#',''); if(h.length===3) h=h.split('').map(c=>c+c).join('');
+  const r=parseInt(h.slice(0,2),16),g=parseInt(h.slice(2,4),16),b=parseInt(h.slice(4,6),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+let _t0=performance.now();
+function perf(){ return performance.now()-_t0; }
+
+// ── main raf loop ──
+let lastT=performance.now();
+function frame(now){
+  const dt=Math.min(40, now-lastT)/16.67; lastT=now;
+  x.clearRect(0,0,SW,SH);
+  // section title
+  x.fillStyle='#46525f'; x.font='10px sans-serif'; x.textAlign='left';
+  x.fillText('PIPELINE — 7 stages, looping on resident params', 18, 18);
+  x.fillText('DATA PLANE — Gaussians stream GDDR → project → bins → Tensix grid → kernels → back to GDDR (Adam)', 18, PIPE_Y+58);
+
+  drawPipeline();
+  drawDataPlane();
+  stepParts(dt);
+  drawParticles();
+  requestAnimationFrame(frame);
+}
+
+// ── stage clock: walk the active pulsing stage (visual cadence) ──
+function advanceStage(){
+  // dwell longer on the dominant stage so the pulse matches the bottleneck
+  stagePhase += 0.5;
+  if(stagePhase>=1){ stagePhase=0; active=(active+1)%STAGES.length;
+    // if we just looped back to B, that's a "step" visually
+  }
+}
+
+// ── data clock ──
+function dataClock(){
+  if(paused) return;
+  if(MODE==='LIVE' || liveWanted){ /* live poll handles data */ }
+  else demoTick();
+}
+
+// boot
+buildTimingRows();
+demoTick();               // seed
+setMode('DEMO','offline demo — synthetic timings that evolve like a real run');
+requestAnimationFrame(frame);
+setInterval(advanceStage, 360);    // pipeline cadence
+setInterval(()=>{ dataClock(); }, 700);   // demo data refresh
+setInterval(()=>{ if(liveWanted) livePoll(); }, 500);  // LIVE poll @500ms
+</script>
+</body>
+</html>

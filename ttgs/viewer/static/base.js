@@ -77,6 +77,28 @@ function pruneGaussians() {
   postCommand('prune', {threshold: t});
 }
 
+// Interactive "grab the camera" — nudge the CURRENT camera's 6-DoF extrinsics (requires pose-opt on).
+// Low-level: post an arbitrary (omega, trans) correction for the current camera. Returns false if no cam.
+// omega = so(3) rotation [rx,ry,rz] (rad); trans = [tx,ty,tz] (world units). Used by the buttons AND the
+// WASD/mouse drive (which sends fractional, combined nudges).
+function poseNudgeRaw(omega, trans) {
+  const st = (typeof getTrainState === 'function') ? getTrainState() : null;
+  const cam = st && st.camera_name;
+  if (!cam) return false;
+  postCommand('pose_nudge', {camera_name: cam, omega: omega || [0, 0, 0], trans: trans || [0, 0, 0]});
+  return true;
+}
+
+// Button helper: one axis by the pose-step magnitude. kind: 'omega'|'trans'; axis: 0|1|2; sign: ±1.
+function poseNudge(kind, axis, sign) {
+  const el = document.getElementById('pose-step');
+  let step = el ? parseFloat(el.value) : NaN;
+  if (!isFinite(step) || step <= 0) step = (kind === 'omega') ? 0.005 : 0.01;
+  const omega = [0, 0, 0], trans = [0, 0, 0];
+  (kind === 'omega' ? omega : trans)[axis] = sign * step;
+  if (!poseNudgeRaw(omega, trans)) alert('No active camera — start training first.');
+}
+
 // ── Image helpers ────────────────────────────────────────────────────────────
 function setImg(imgId, phId, b64) {
   const img = document.getElementById(imgId);
@@ -93,7 +115,7 @@ function renderTrainStats(containerId, d) {
   el.innerHTML =
     `step <b>${d.step.toLocaleString()}</b>/${d.total_steps.toLocaleString()} ` +
     `loss <b>${d.loss.toFixed(4)}</b> ` +
-    `L1 ${d.l1.toFixed(4)} SSIM ${d.ssim.toFixed(4)} MSE ${d.mse.toFixed(5)} ` +
+    `L1 ${d.l1.toFixed(4)} PSNR ${(d.psnr || 0).toFixed(2)}dB ` +
     `<b>${d.n_gaussians.toLocaleString()}</b>G ` +
     `cam: ${d.camera_name}`;
 }
@@ -102,14 +124,13 @@ function renderTrainStats(containerId, d) {
 //
 // drawLossChart(canvasId, history, {camera})
 //
-// history: [{step, loss, l1, ssim, mse, camera_name}, ...]
+// history: [{step, loss, l1, psnr, mse, camera_name}, ...]
 // Draws multi-line loss curves on a <canvas>.
 
 const CHART_COLORS = {
   loss: '#4af',
   l1:   '#f84',
-  ssim: '#a6f',
-  mse:  '#f44',
+  psnr: '#a6f',
 };
 
 async function fetchHistory(camera) {
@@ -136,7 +157,7 @@ function drawLossChart(canvasId, history, opts = {}) {
   ctx.fillRect(0, 0, W, H);
 
   // Determine which series to show
-  const series = opts.series || ['loss', 'l1', 'ssim', 'mse'];
+  const series = opts.series || ['loss', 'l1'];   // psnr is dB (different scale) — shown in the stats bar, not on this axis
   const highlighted = opts.highlight || null;  // camera name to highlight
 
   // Compute Y range across all visible series
@@ -272,3 +293,98 @@ document.addEventListener('mouseover', e => {
     if (tip) tip.style.display = 'none';
   }
 });
+
+
+// ── Clean tooltips (data-tip) ────────────────────────────────────────────────
+//
+// Any element with data-tip="..." shows a floating, body-anchored tooltip on
+// hover or keyboard focus.  Works for dynamically-inserted controls (delegated).
+//   data-tip        body text
+//   data-tip-title  optional bold heading
+//   data-tip-badge  optional status chip: live | startup | off | both | host
+//
+// Badge → human label.  These describe whether a control is actually honored by
+// the tt-splat (Tenstorrent) training backend — see /docs/controls.html.
+const _TT_BADGE = {
+  live:    {cls: 'live',    label: 'live-editable'},
+  both:    {cls: 'both',    label: 'works · both modes'},
+  startup: {cls: 'startup', label: 'startup only'},
+  host:    {cls: 'host',    label: 'host mode only'},
+  off:     {cls: 'off',     label: 'not wired into TT loop'},
+};
+
+let _ttipEl = null;
+function _ttip() {
+  if (!_ttipEl) {
+    _ttipEl = document.createElement('div');
+    _ttipEl.id = 'ttgs-tip';
+    document.body.appendChild(_ttipEl);
+  }
+  return _ttipEl;
+}
+
+function _showTip(el) {
+  const body = el.getAttribute('data-tip');
+  if (!body) return;
+  const title = el.getAttribute('data-tip-title');
+  const badge = el.getAttribute('data-tip-badge');
+  const tip = _ttip();
+
+  let h = '';
+  if (title || badge) {
+    h += '<div class="tt-head">';
+    if (title) h += '<span class="tt-title">' + title + '</span>';
+    if (badge && _TT_BADGE[badge]) {
+      const b = _TT_BADGE[badge];
+      h += '<span class="tt-badge ' + b.cls + '">' + b.label + '</span>';
+    }
+    h += '</div>';
+  }
+  h += '<div class="tt-body">' + body + '</div>';
+  if (el.hasAttribute('data-tip-more'))
+    h += '<div class="tt-more">' + el.getAttribute('data-tip-more') + '</div>';
+  else
+    h += '<div class="tt-more">ⓘ full guide → /docs/controls.html</div>';
+  tip.innerHTML = h;
+
+  // Measure, then position: prefer below the element, flip above if no room.
+  tip.style.left = '0px'; tip.style.top = '0px';
+  tip.classList.add('show');
+  const r = el.getBoundingClientRect();
+  const tw = tip.offsetWidth, th = tip.offsetHeight;
+  const margin = 8, vw = window.innerWidth, vh = window.innerHeight;
+  let left = r.left + r.width / 2 - tw / 2;
+  left = Math.max(margin, Math.min(left, vw - tw - margin));
+  let top = r.bottom + margin;
+  if (top + th > vh - margin) top = r.top - th - margin;   // flip above
+  if (top < margin) top = margin;
+  tip.style.left = Math.round(left) + 'px';
+  tip.style.top = Math.round(top) + 'px';
+}
+
+function _hideTip() {
+  if (_ttipEl) _ttipEl.classList.remove('show');
+}
+
+function initTooltips() {
+  // Delegated — covers controls injected later by components.js.
+  document.addEventListener('mouseover', e => {
+    const el = e.target.closest && e.target.closest('[data-tip]');
+    if (el) _showTip(el);
+  });
+  document.addEventListener('mouseout', e => {
+    const el = e.target.closest && e.target.closest('[data-tip]');
+    if (el && !el.contains(e.relatedTarget)) _hideTip();
+  });
+  document.addEventListener('focusin', e => {
+    const el = e.target.closest && e.target.closest('[data-tip]');
+    if (el) _showTip(el);
+  });
+  document.addEventListener('focusout', _hideTip);
+  window.addEventListener('scroll', _hideTip, true);
+}
+
+if (document.readyState === 'loading')
+  document.addEventListener('DOMContentLoaded', initTooltips);
+else
+  initTooltips();
