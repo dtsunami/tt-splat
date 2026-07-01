@@ -142,12 +142,41 @@ async function fetchHistory(camera) {
   } catch { return []; }
 }
 
+// Stable color per camera: hash the name → hue. The same camera is always the
+// same color across redraws, so a recurring loss-spike offender shows up as the
+// same hue marching across the chart (the phase-lock made visible).
+function _camHue(name) {
+  let h = 0;
+  const s = String(name || '');
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h % 360;
+}
+function camColor(name, a = 1) { return `hsla(${_camHue(name)},72%,62%,${a})`; }
+
+// Exponential moving average (trend line + spike-prominence baseline).
+function _ema(vals, alpha) {
+  let e = null; const out = [];
+  for (const v of vals) {
+    if (v === undefined || v === null || !isFinite(v)) { out.push(e); continue; }
+    e = (e == null) ? v : alpha * v + (1 - alpha) * e;
+    out.push(e);
+  }
+  return out;
+}
+
 function drawLossChart(canvasId, history, opts = {}) {
   const canvas = document.getElementById(canvasId);
   if (!canvas || !history.length) return;
   const ctx = canvas.getContext('2d');
+  // Keep the backing store matched to the displayed size so the chart stays crisp
+  // when its container is resized (the loss panel is user-expandable).
+  if (canvas.clientWidth && canvas.clientHeight &&
+      (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight)) {
+    canvas.width = canvas.clientWidth;
+    canvas.height = canvas.clientHeight;
+  }
   const W = canvas.width, H = canvas.height;
-  const pad = {l: 50, r: 10, t: 20, b: 24};
+  const pad = {l: 52, r: 10, t: 20, b: 24};
   const cw = W - pad.l - pad.r, ch = H - pad.t - pad.b;
 
   ctx.clearRect(0, 0, W, H);
@@ -158,41 +187,53 @@ function drawLossChart(canvasId, history, opts = {}) {
 
   // Determine which series to show
   const series = opts.series || ['loss', 'l1'];   // psnr is dB (different scale) — shown in the stats bar, not on this axis
-  const highlighted = opts.highlight || null;  // camera name to highlight
+  const highlighted = opts.highlight || null;  // camera name to emphasize (white ring)
+  const logY = opts.logY !== false;            // log scale by default — unsquashes the late-training crawl
 
-  // Compute Y range across all visible series
+  // Compute Y range across all visible series (positive values only for log)
   let yMin = Infinity, yMax = -Infinity;
   for (const key of series) {
     for (const h of history) {
       const v = h[key];
-      if (v !== undefined && v !== null && isFinite(v)) {
+      if (v !== undefined && v !== null && isFinite(v) && (!logY || v > 0)) {
         if (v < yMin) yMin = v;
         if (v > yMax) yMax = v;
       }
     }
   }
   if (!isFinite(yMin)) return;
-  const yRange = Math.max(yMax - yMin, 1e-6);
-  // Add 10% padding
-  yMin -= yRange * 0.05;
-  yMax += yRange * 0.05;
+
+  let toY, gridVals;
+  if (logY) {
+    const lo = Math.log10(yMin), hi = Math.log10(yMax);
+    const lr = Math.max(hi - lo, 1e-6);
+    const lMin = lo - lr * 0.05, lMax = hi + lr * 0.05;
+    const floor = Math.pow(10, lMin);
+    toY = v => pad.t + (1 - (Math.log10(Math.max(v, floor)) - lMin) / (lMax - lMin)) * ch;
+    gridVals = [];
+    const nGrid = 4;
+    for (let i = 0; i <= nGrid; i++) gridVals.push(Math.pow(10, lMin + (lMax - lMin) * (i / nGrid)));
+  } else {
+    const yRange = Math.max(yMax - yMin, 1e-6);
+    const a = yMin - yRange * 0.05, b = yMax + yRange * 0.05;
+    toY = v => pad.t + (1 - (v - a) / (b - a)) * ch;
+    gridVals = [];
+    const nGrid = 4;
+    for (let i = 0; i <= nGrid; i++) gridVals.push(a + (b - a) * (i / nGrid));
+  }
 
   const xMin = history[0].step;
   const xMax = history[history.length - 1].step;
   const xRange = Math.max(xMax - xMin, 1);
-
   const toX = s => pad.l + ((s - xMin) / xRange) * cw;
-  const toY = v => pad.t + (1 - (v - yMin) / (yMax - yMin)) * ch;
 
-  // Grid lines
+  // Grid lines + y labels (in the left gutter, off the trace)
   ctx.strokeStyle = '#222'; ctx.lineWidth = 1;
-  const nGrid = 4;
-  ctx.font = '10px monospace'; ctx.fillStyle = '#555'; ctx.textAlign = 'right';
-  for (let i = 0; i <= nGrid; i++) {
-    const v = yMin + (yMax - yMin) * (i / nGrid);
+  ctx.font = '10px monospace'; ctx.fillStyle = '#666'; ctx.textAlign = 'right';
+  for (const v of gridVals) {
     const y = toY(v);
     ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
-    ctx.fillText(v.toFixed(4), pad.l - 4, y + 3);
+    ctx.fillText(v < 0.01 ? v.toExponential(1) : v.toFixed(4), pad.l - 4, y + 3);
   }
 
   // X axis labels
@@ -212,7 +253,7 @@ function drawLossChart(canvasId, history, opts = {}) {
     let started = false;
     for (const h of history) {
       const v = h[key];
-      if (v === undefined || v === null || !isFinite(v)) continue;
+      if (v === undefined || v === null || !isFinite(v) || (logY && v <= 0)) continue;
       const x = toX(h.step), y = toY(v);
       if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
     }
@@ -220,14 +261,35 @@ function drawLossChart(canvasId, history, opts = {}) {
     ctx.globalAlpha = 1;
   }
 
-  // Highlighted camera dots (if filtering per-camera)
-  if (highlighted) {
-    ctx.fillStyle = '#ff0';
-    for (const h of history) {
-      if (h.camera_name === highlighted) {
-        ctx.beginPath(); ctx.arc(toX(h.step), toY(h.loss), 3, 0, Math.PI * 2); ctx.fill();
-      }
-    }
+  // EMA trend overlay for loss — the smoothed signal under the spikes.
+  const lossVals = history.map(h => h.loss);
+  const ema = _ema(lossVals, 0.15);
+  ctx.strokeStyle = '#fff'; ctx.globalAlpha = 0.28; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  let es = false;
+  for (let i = 0; i < history.length; i++) {
+    const v = ema[i];
+    if (v == null || !isFinite(v) || (logY && v <= 0)) continue;
+    const x = toX(history[i].step), y = toY(v);
+    if (!es) { ctx.moveTo(x, y); es = true; } else ctx.lineTo(x, y);
+  }
+  ctx.stroke(); ctx.globalAlpha = 1;
+
+  // Per-camera markers: color = camera, radius = how far the point juts above its
+  // local EMA (spike prominence). Spikes become big colored dots; the recurring
+  // offender marches across in one hue. Highlighted camera gets a white ring.
+  for (let i = 0; i < history.length; i++) {
+    const h = history[i];
+    if (h.loss == null || !isFinite(h.loss) || (logY && h.loss <= 0)) continue;
+    const base = ema[i] || h.loss;
+    const prom = base > 0 ? Math.max(0, (h.loss - base) / base) : 0;   // relative jut above trend
+    const isHi = highlighted && h.camera_name === highlighted;
+    const r = isHi ? 3.2 : Math.min(1.4 + prom * 9, 5);
+    if (!isHi && prom < 0.02 && r < 1.6) continue;   // skip the calm baseline to cut clutter
+    const x = toX(h.step), y = toY(h.loss);
+    ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2);
+    ctx.fillStyle = camColor(h.camera_name, 0.95); ctx.fill();
+    if (isHi) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.4; ctx.stroke(); }
   }
 
   // Legend
@@ -238,17 +300,57 @@ function drawLossChart(canvasId, history, opts = {}) {
     ctx.fillText(key, lx, pad.t + 12);
     lx += ctx.measureText(key).width + 12;
   }
+  ctx.fillStyle = '#fff'; ctx.globalAlpha = 0.28;
+  ctx.fillText('ema', lx, pad.t + 12); lx += ctx.measureText('ema').width + 14;
+  ctx.globalAlpha = 1; ctx.fillStyle = '#567';
+  ctx.fillText('· dot = camera (click → focus)', lx, pad.t + 12);
 
-  // Hover handler (attach once)
+  // Interaction state + handlers (attach once)
+  canvas._history = history;
+  canvas._opts = {pad, cw, ch, xMin, xRange, series, toX, toY, onPick: opts.onPick};
+  canvas._drawArgs = {id: canvasId, opts};
+  canvas.style.cursor = 'pointer';
   if (!canvas._hasHover) {
     canvas._hasHover = true;
-    canvas._history = history;
-    canvas._opts = {pad, cw, ch, xMin, xRange, yMin, yMax, series};
     canvas.addEventListener('mousemove', _chartHover);
-  } else {
-    canvas._history = history;
-    canvas._opts = {pad, cw, ch, xMin, xRange, yMin, yMax, series};
+    canvas.addEventListener('click', _chartClick);
+    // Redraw at full resolution when the (resizable) container is dragged.
+    if (window.ResizeObserver) {
+      const ro = new ResizeObserver(() => {
+        const a = canvas._drawArgs;
+        if (a && canvas._history && canvas._history.length) drawLossChart(a.id, canvas._history, a.opts);
+      });
+      ro.observe(canvas);
+    }
   }
+}
+
+// Find the history point nearest the mouse x (shared by hover + click).
+function _chartNearest(canvas, e) {
+  const {pad, cw, xMin, xRange} = canvas._opts;
+  const history = canvas._history;
+  const rect = canvas.getBoundingClientRect();
+  const mx = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const step = xMin + ((mx - pad.l) / cw) * xRange;
+  let closest = null, minDist = Infinity;
+  for (const h of history) {
+    const d = Math.abs(h.step - step);
+    if (d < minDist) { minDist = d; closest = h; }
+  }
+  return closest;
+}
+
+// Click a marker → focus training on that camera (render jumps to that view).
+// Pages may pass opts.onPick(camera_name, point) to customize (e.g. navigate).
+function _chartClick(e) {
+  const canvas = e.target;
+  if (!canvas._opts || !canvas._history) return;
+  const p = _chartNearest(canvas, e);
+  if (!p || !p.camera_name) return;
+  if (canvas._opts.onPick) { canvas._opts.onPick(p.camera_name, p); return; }
+  try { postCommand('focus_camera', {camera_name: p.camera_name}); } catch {}
+  const tip = document.getElementById('chart-tooltip');
+  if (tip) { tip.textContent = `focus → ${p.camera_name}`; tip.style.borderColor = camColor(p.camera_name); }
 }
 
 function _chartHover(e) {
@@ -275,12 +377,14 @@ function _chartHover(e) {
     tip.style.cssText = 'position:fixed;background:#222;color:#ccc;padding:4px 8px;border:1px solid #444;border-radius:3px;font:11px monospace;pointer-events:none;z-index:100;white-space:pre';
     document.body.appendChild(tip);
   }
-  const lines = [`step ${closest.step.toLocaleString()}  ${closest.camera_name || ''}`];
+  const lines = [`step ${closest.step.toLocaleString()}  ●${closest.camera_name || ''}`];
   for (const k of series) {
     const v = closest[k];
     if (v !== undefined) lines.push(`${k}: ${v.toFixed(5)}`);
   }
+  lines.push('click → focus this camera');
   tip.textContent = lines.join('\n');
+  tip.style.borderColor = camColor(closest.camera_name);
   tip.style.left = (e.clientX + 12) + 'px';
   tip.style.top  = (e.clientY - 10) + 'px';
   tip.style.display = 'block';

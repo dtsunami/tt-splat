@@ -48,8 +48,10 @@ densify_every = 100
 densify_from = 500
 # Stop densifying after this many iterations.
 densify_until = 15_000
-# Gradient threshold for densification.
-densify_grad_threshold = 0.0002
+# Gradient threshold for densification. 0 = ADAPTIVE (mean+std, scale-invariant) — USE THIS.
+# NOT gsplat's 0.0002: that's NDC-space, but tt-splat's densify signal is pixel-space ‖∂L/∂(u,v)‖
+# (~2/W ≈ 1000x smaller), so a fixed 0.0002 clones nothing. See server/densify.py.
+densify_grad_threshold = 0.0
 # Opacity reset interval.
 opacity_reset_every = 3_000
 # Save per-camera render snapshots every N steps (0 = disabled).

@@ -48,14 +48,21 @@
       opacity: 0.3; mix-blend-mode: multiply;
     }
 
-    /* ── chart strip ── */
+    /* ── chart strip (user-expandable: drag the bottom edge) ── */
     #chart-area {
-      height: 180px; flex-shrink: 0; background: #0e0e0e;
+      height: 200px; flex-shrink: 0; background: #0e0e0e;
       border-top: 1px solid #2a2a2a; position: relative;
+      resize: vertical; overflow: hidden;
+      min-height: 120px; max-height: 75vh;
     }
     #chart-area .chart-header {
       position: absolute; top: 4px; left: 10px; z-index: 1;
       font-size: 10px; color: #555;
+    }
+    /* resize affordance in the corner */
+    #chart-area::after {
+      content: '⋰'; position: absolute; right: 3px; bottom: 1px;
+      font-size: 11px; color: #444; pointer-events: none; z-index: 1;
     }
 
     /* ── GPU metrics panel ── */
@@ -81,7 +88,8 @@
     /* ── pipeline stage breakdown ── */
     #stage-panel {
       display: none; flex-shrink: 0; background: #0e0e0e;
-      border-top: 1px solid #2a2a2a; padding: 8px 16px;
+      border-bottom: 1px solid #2a2a2a; padding: 8px 16px;
+      order: -1;   /* hoist the per-step convergence timing above the image area */
     }
     #stage-panel.visible { display: block; }
     .stage-head {
@@ -148,6 +156,15 @@
     #pose-hud.show { display: block; }
     #pose-hud b { color: #fb4; }
     #pose-hud .hud-corr { color: #8fd; }
+
+    /* ── camera cycler (step through included frames in the training pane) ── */
+    .cam-nav { display: flex; align-items: center; gap: 4px; margin-left: 10px; }
+    .cam-btn {
+      cursor: pointer; padding: 1px 8px; border-radius: 8px; user-select: none;
+      border: 1px solid #3a4a5a; color: #9cc; background: #162028; font-size: 12px; line-height: 1.5;
+    }
+    .cam-btn:hover { background: #1e2c38; color: #cfe; }
+    .cam-pos { font: 11px monospace; color: #8ab; min-width: 52px; text-align: center; }
   </style>
 </head>
 <body>
@@ -155,7 +172,9 @@
 <div class="topbar">
   <a href="/"><b>ttgs</b></a> <span class="sep">|</span>
   <a href="/images">images</a> <span class="sep">|</span>
-  <b>training</b>
+  <b>training</b> <span class="sep">|</span>
+  <a href="/pose">🎮 pose</a> <span class="sep">|</span>
+  <a href="/densify">🌱 densify</a>
   <span class="sep">|</span>
   <a href="/docs/controls.html" target="_blank" title="Every control &amp; knob, explained for humans">🎛️ controls</a>
   <a href="/docs/pipeline_cartoon.html" target="_blank" title="How training works, for humans">🎢 pipeline</a>
@@ -183,6 +202,12 @@
     <div id="preview-row">
       <div class="preview-cell" id="render-cell">
         <div class="preview-label"><b>Render</b>
+          <span class="cam-nav" title="Step through included frames (← / →). Focuses each so you can inspect its render/GT/diff; ⟳ resumes auto-cycling. Excluded frames are skipped.">
+            <span class="cam-btn" onclick="cycleCam(-1)">‹</span>
+            <span class="cam-pos" id="cam-pos">--</span>
+            <span class="cam-btn" onclick="cycleCam(1)">›</span>
+            <span class="cam-btn" id="cam-unfocus" onclick="cycleCamClear()" title="Resume auto-cycling (clear focus)">⟳</span>
+          </span>
           <span class="spacer"></span>
           <span class="splat-bar" id="splat-bar" title="Bubble gun: spray new splats (add) where detail is missing, or vacuum up floaters/fog (erase). Aim on the render, click-drag to fire.">
             <span class="splat-btn" id="splat-toggle" onclick="splatToggle()">🫧 Splat tool</span>
@@ -293,10 +318,52 @@
 
 <script src="/static/base.js"></script>
 <script src="/static/components.js"></script>
+<script src="/static/drive.js"></script>
 <script>
 const ps = document.getElementById('poll-status');
 let _chartTick = 0;
 let _currentCam = null;
+let _focusCam = null;      // camera training is pinned to (null = auto-cycling)
+
+// ── Camera cycler: step through INCLUDED frames in the training pane ──────────
+// Focuses each frame (pins training to it) so you can inspect its render/GT/diff.
+// Excluded frames (from the Frames list / _frameListData) are skipped. ⟳ clears focus.
+function _includedFrames() {
+  return (typeof _frameListData !== 'undefined' ? _frameListData : [])
+    .filter(function(f) { return !f.excluded; }).map(function(f) { return f.name; });
+}
+function cycleCam(dir) {
+  const inc = _includedFrames();
+  if (!inc.length) return;
+  const cur = _focusCam || _currentCam;
+  let i = inc.indexOf(cur);
+  if (i < 0) i = (dir > 0 ? -1 : 0);                 // not found → start from an end
+  _focusCam = inc[(i + dir + inc.length) % inc.length];
+  postCommand('focus_camera', { camera_name: _focusCam });
+  _updateCamNav();
+}
+function cycleCamClear() {
+  _focusCam = null;
+  postCommand('focus_camera', { camera_name: null });
+  _updateCamNav();
+}
+function _updateCamNav() {
+  const pos = document.getElementById('cam-pos');
+  const unf = document.getElementById('cam-unfocus');
+  if (!pos) return;
+  const inc = _includedFrames();
+  const i = inc.indexOf(_currentCam);
+  pos.textContent = (i >= 0 ? (i + 1) : '?') + '/' + inc.length + (_focusCam ? ' 🔒' : '');
+  if (unf) unf.style.opacity = _focusCam ? '1' : '0.35';
+}
+// Arrow keys cycle (ignored while typing in a field or driving the camera).
+document.addEventListener('keydown', function(e) {
+  const tag = (document.activeElement && document.activeElement.tagName) || '';
+  if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag)) return;
+  if (typeof drive !== 'undefined' && drive.active) return;   // WASD/drive owns the keyboard
+  if (e.key === 'ArrowRight') { cycleCam(1); e.preventDefault(); }
+  else if (e.key === 'ArrowLeft') { cycleCam(-1); e.preventDefault(); }
+});
 
 // ── Pipeline stage breakdown (B/raster/A/D/C) ───────────────────────────────
 // Each chip links to a plain-language "cartoon" explainer of that stage.
@@ -411,6 +478,10 @@ async function tick() {
         if (_showMask) loadMaskOverlay(_currentCam);
       }
 
+      // Keep the camera cycler in sync with the backend's authoritative focus
+      _focusCam = d.focus_camera || null;
+      _updateCamNav();
+
       // Chart
       if (++_chartTick % 4 === 0) {
         const history = await fetchHistory();
@@ -517,76 +588,7 @@ async function _splatFire() {
   if (br) br.addEventListener('input', () => { splatTool.brush = parseFloat(br.value); });
 })();
 
-// ── Camera Drive: WASD + mouse-look pose nudging (game-style) ────────────────
-// Drives the CURRENT camera's 6-DoF extrinsics — the interactive "grab the ghosting camera and nudge"
-// handle. Reuses the render overlay for mouse capture + a global keydown for WASD/QE/ZC. Inputs are
-// COALESCED and sent at ~10 Hz as one combined pose_nudge(omega,trans), so the command queue (drained
-// once per training step) isn't flooded. Turning Drive on enables pose-opt (driving IS pose-opt).
-// Note: with a ~1 s/step loop the render catches up a step behind the input — expected.
-const drive = { active:false, keys:{}, lookDX:0, lookDY:0, dragging:false, lx:0, ly:0, timer:null,
-                mov:0.02, rot:0.012, look:0.0018 };   // per-tick step sizes (world units / rad)
-
-function _driveTick() {
-  if (!drive.active) return;
-  const o=[0,0,0], t=[0,0,0], k=drive.keys, m=drive.mov, r=drive.rot;
-  if (k['w']) t[2]-=m; if (k['s']) t[2]+=m;      // forward / back
-  if (k['a']) t[0]-=m; if (k['d']) t[0]+=m;      // strafe left / right
-  if (k['q']) t[1]-=m; if (k['e']) t[1]+=m;      // down / up
-  if (k['z']) o[2]-=r; if (k['c']) o[2]+=r;      // roll
-  o[1]+=drive.lookDX*drive.look;                 // mouse X -> yaw
-  o[0]+=drive.lookDY*drive.look;                 // mouse Y -> pitch
-  drive.lookDX=0; drive.lookDY=0;
-  if (o.some(v=>v) || t.some(v=>v)) {
-    if (!poseNudgeRaw(o, t)) { /* no active camera yet */ }
-  }
-}
-
-function driveToggle() {
-  drive.active = !drive.active;
-  const btn=document.getElementById('drive-toggle'), cv=document.getElementById('splat-overlay');
-  btn.classList.toggle('on', drive.active);
-  document.getElementById('pose-hud').classList.toggle('show', drive.active);
-  if (drive.active) {
-    if (typeof splatTool!=='undefined' && splatTool.active) splatToggle();   // mutually exclusive w/ bubble gun
-    cv.classList.add('active'); cv.classList.add('drive');
-    if (typeof postConfig==='function') postConfig({pose_opt: 1});           // driving IS pose-opt → ensure on
-    if (!drive.timer) drive.timer=setInterval(_driveTick, 100);             // 10 Hz coalesced send
-  } else {
-    cv.classList.remove('active'); cv.classList.remove('drive');
-    drive.keys={}; drive.lookDX=drive.lookDY=0; drive.dragging=false;
-    if (drive.timer) { clearInterval(drive.timer); drive.timer=null; }
-  }
-}
-
-function _updatePoseHud(d) {
-  const hud=document.getElementById('pose-hud'); if(!hud) return;
-  const pc = d && d.pose_corr;
-  const corr = pc ? `Δrot ${pc.dw_deg.toFixed(2)}°  Δpos ${pc.dt.toFixed(3)}`
-                  : 'pose-opt off (enable in Camera Pose-Opt, or hit Drive)';
-  hud.innerHTML = drive.active
-    ? `<b>🎮 Drive</b> WASD move · QE down/up · ZC roll · drag = look<br><span class="hud-corr">${corr}</span>`
-    : `<span class="hud-corr">${corr}</span>`;
-  hud.classList.toggle('show', drive.active || !!pc);   // show whenever there's a correction to see
-}
-
-// keyboard (only while Drive is on, and not while typing in a field)
-document.addEventListener('keydown', e => {
-  if (!drive.active) return;
-  const tag=(e.target&&e.target.tagName)||'';
-  if (tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT') return;
-  const k=(e.key||'').toLowerCase();
-  if ('wasdqezc'.indexOf(k)>=0 && k.length===1) { drive.keys[k]=true; e.preventDefault(); }
-});
-document.addEventListener('keyup', e => { const k=(e.key||'').toLowerCase(); if (drive.keys[k]!==undefined) drive.keys[k]=false; });
-
-// mouse-look: drag on the render overlay (drive handlers coexist with the splat ones; each guards its tool)
-(function _driveMouseInit(){
-  const cv=document.getElementById('splat-overlay'); if(!cv) return;
-  cv.addEventListener('mousedown', e => { if(!drive.active) return; drive.dragging=true; drive.lx=e.clientX; drive.ly=e.clientY; e.preventDefault(); });
-  cv.addEventListener('mousemove', e => { if(!drive.active||!drive.dragging) return; drive.lookDX+=e.clientX-drive.lx; drive.lookDY+=e.clientY-drive.ly; drive.lx=e.clientX; drive.ly=e.clientY; });
-  window.addEventListener('mouseup', () => { drive.dragging=false; });
-})();
-
+// Camera Drive (WASD + mouse-look pose nudging) lives in /static/drive.js — shared with the /pose view.
 // ── GPU metrics ────────────────────────────────────────────────────────────
 const _gpuHist = {};
 const _GPU_MAX = 60;

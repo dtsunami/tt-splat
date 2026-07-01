@@ -1,16 +1,22 @@
 {
   "P4120179.JPG": {},
   "P4120180.JPG": {},
-  "P4120181.JPG": {},
+  "P4120181.JPG": {
+    "excluded": true
+  },
   "P4120182.JPG": {
     "excluded": false
   },
   "P4120189.JPG": {
-    "excluded": false
+    "excluded": true
   },
-  "P4120190.JPG": {},
+  "P4120190.JPG": {
+    "excluded": true
+  },
   "P4120191.JPG": {},
   "P4120192.JPG": {},
-  "P4120193.JPG": {},
+  "P4120193.JPG": {
+    "excluded": true
+  },
   "P4120194.JPG": {}
 }

@@ -70,12 +70,38 @@ class TrainingController:
         self._snapshot_every = snapshot_every          # save per-camera snapshots every N steps
         self._live_config: dict[str, Any] = {}        # current training config (set by training loop)
         self._command_log: list[dict[str, Any]] = []  # recent executed commands with stats
+        self._densify_log: list[dict[str, Any]] = []  # recent densify events (clone/split/prune per step)
+        self._cameras: list[dict[str, Any]] = []      # static per-camera base extrinsics+intrinsics (pose 3D view)
+        self._pose: dict[str, Any] = {}               # latest {step, focus, deltas:[[wx,wy,wz,tx,ty,tz]...]}
+        self._pose_traj: dict[str, list] = {}         # cam name -> [{step, d:[6]}] history (the flag scrubber)
+        self._pointcloud: dict[str, Any] = {}         # {step, means:[[x,y,z]...], colors:[[r,g,b]...]} subsampled
+        self._status: dict[str, Any] = {"state": "idle", "message": ""}   # train lifecycle, surfaced in the viewer
+        self._events: list[dict[str, Any]] = []        # recent notable events (skip-step / checkpoint / diverged)
 
     def pause(self) -> None:
         self._pause_event.set()
 
     def resume(self) -> None:
         self._pause_event.clear()
+
+    # ── train lifecycle status (surfaced to the viewer so a stop/fail isn't a silent freeze) ──
+    def set_status(self, state: str, message: str = "") -> None:
+        with self._lock:
+            self._status = {"state": str(state), "message": str(message)}
+
+    def get_status(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._status)
+
+    def log_event(self, kind: str, message: str, step: int = 0) -> None:
+        with self._lock:
+            self._events.append({"kind": str(kind), "message": str(message), "step": int(step)})
+            if len(self._events) > 100:
+                self._events = self._events[-100:]
+
+    def get_events(self, last_n: int = 12) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._events[-last_n:])
 
     @property
     def is_paused(self) -> bool:
@@ -167,6 +193,55 @@ class TrainingController:
             if last_n > 0:
                 return list(self._history[-last_n:])
             return list(self._history)
+
+    def log_densify(self, stat: dict[str, Any], step: int) -> None:
+        """Record one densify event (clone/split/prune + N before/after) for the /densify view feed."""
+        with self._lock:
+            self._densify_log.append({"step": int(step),
+                                      **{k: int(stat.get(k, 0)) for k in
+                                         ("clone", "split", "prune", "n_before", "n_after")}})
+            self._densify_log = self._densify_log[-200:]
+
+    def get_densify_log(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._densify_log)
+
+    # ---- pose 3D view data (cameras / corrections / flag trajectory) ----
+    def set_cameras(self, cams: list[dict[str, Any]]) -> None:
+        """Static per-camera base extrinsics+intrinsics (pushed once at train start). Each:
+        {name, R:[9] row-major, t:[3], fx, fy, cx, cy}."""
+        with self._lock:
+            self._cameras = list(cams)
+
+    def push_pose(self, step: int, deltas: list[list[float]], focus: str | None) -> None:
+        """Latest per-camera 6-DoF correction δ=(ω,t) + append to each camera's flag trajectory (the
+        scroll-wheel history). Called every few steps by the loop; trajectory capped per camera."""
+        with self._lock:
+            self._pose = {"step": int(step), "focus": focus, "deltas": deltas}
+            for cam, d in zip(self._cameras, deltas):
+                nm = cam.get("name")
+                tr = self._pose_traj.setdefault(nm, [])
+                if not tr or tr[-1]["d"] != d:                 # only on change — sparse trajectory
+                    tr.append({"step": int(step), "d": list(d)})
+                    if len(tr) > 400:
+                        del tr[:-400]
+
+    def get_cameras(self) -> dict[str, Any]:
+        with self._lock:
+            return {"cameras": list(self._cameras), "pose": dict(self._pose)}
+
+    def get_pose_traj(self, camera: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._pose_traj.get(camera, []))
+
+    def set_pointcloud(self, step: int, means: list, colors: list) -> None:
+        """Subsampled gaussian means+colors for 3D context (pushed periodically)."""
+        with self._lock:
+            self._pointcloud = {"step": int(step), "means": means, "colors": colors}
+
+    def get_pointcloud(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._pointcloud)
 
     def get_latest(self) -> dict[str, Any] | None:
         with self._lock:
@@ -412,6 +487,14 @@ def build_app(pipeline):
     async def training_page():
         return HTMLResponse(_tpl.joinpath("training.html").read_text(encoding="utf-8"))
 
+    @app.get("/pose", response_class=HTMLResponse)
+    async def pose_page():
+        return HTMLResponse(_tpl.joinpath("pose.html").read_text(encoding="utf-8"))
+
+    @app.get("/densify", response_class=HTMLResponse)
+    async def densify_page():
+        return HTMLResponse(_tpl.joinpath("densify.html").read_text(encoding="utf-8"))
+
     @app.get("/images", response_class=HTMLResponse)
     async def gallery_page():
         return HTMLResponse(_tpl.joinpath("gallery.html").read_text(encoding="utf-8"))
@@ -432,10 +515,10 @@ def build_app(pipeline):
             return Response(status_code=404)
         return HTMLResponse(path.read_text(encoding="utf-8"))
 
-    @app.get("/static/{filename}")
+    @app.get("/static/{filename:path}")
     async def static_file(filename: str):
-        path = _static / filename
-        if not path.exists() or not path.is_file():
+        path = (_static / filename).resolve()
+        if _static.resolve() not in path.parents or not path.is_file():   # serve subdirs (vendor/) safely, no ../ escape
             return Response(status_code=404)
         ct = "text/css" if filename.endswith(".css") else \
              "application/javascript" if filename.endswith(".js") else \
@@ -593,6 +676,26 @@ def build_app(pipeline):
 
     # ── Training state (polled by dashboard) ────────────────────────────────
 
+    @app.get("/densify/log")
+    async def densify_log():
+        """Recent densify events (clone/split/prune + N before/after per step) — for the /densify view feed."""
+        return pipeline.training.get_densify_log()
+
+    @app.get("/cameras")
+    async def cameras():
+        """Static per-camera base extrinsics+intrinsics + the latest 6-DoF corrections — pose 3D view."""
+        return pipeline.training.get_cameras()
+
+    @app.get("/pose/history")
+    async def pose_history(camera: str):
+        """One camera's correction trajectory [{step, d:[ωx,ωy,ωz,tx,ty,tz]}] — the flag scrubber."""
+        return pipeline.training.get_pose_traj(camera)
+
+    @app.get("/pointcloud")
+    async def pointcloud():
+        """Subsampled gaussian means+colors for 3D context in the pose view."""
+        return pipeline.training.get_pointcloud()
+
     @app.get("/state/history")
     async def state_history(last: int = 0, camera: str = ""):
         """Return loss history. Optional ?last=N or ?camera=name filters."""
@@ -604,8 +707,14 @@ def build_app(pipeline):
     @app.get("/state")
     async def state():
         latest = pipeline.training.get_latest()
+        st = pipeline.training.get_status()
         if latest is None:
-            return Response(status_code=204)
+            if st.get("state", "idle") == "idle":
+                return Response(status_code=204)
+            # no render yet but training has a status to report (e.g. failed at startup)
+            latest = {"step": 0, "total_steps": 0, "loss": 0.0, "l1": 0.0, "mse": 0.0,
+                      "psnr": 0.0, "n_gaussians": 0, "camera_name": "", "is_paused": False}
+        latest = {**latest, "train_status": st, "train_events": pipeline.training.get_events(8)}
         # Serialize once to avoid Content-Length mismatch when the dict
         # is mutated between Starlette's two serialization passes.
         body = json.dumps(latest).encode()
@@ -843,11 +952,19 @@ class DashboardServer:
 
         def _train():
             try:
+                self._pipeline.training.set_status("running", "training")
                 result_box.append(fn(*args, **kwargs))
+                self._pipeline.training.set_status("done", "training complete")
+                server.should_exit = True                 # clean finish → shut the server down
             except Exception as exc:
+                import traceback
                 exc_box.append(exc)
-            finally:
-                server.should_exit = True
+                tb = traceback.format_exc().strip().splitlines()
+                self._pipeline.training.set_status("failed", str(exc))
+                self._pipeline.training.log_event("error", tb[-1] if tb else str(exc))
+                console.print(f"[bold red]training thread crashed:[/] {exc}")
+                console.print(f"[dim]{traceback.format_exc()}[/]")
+                # keep the dashboard ALIVE so the failure is visible in the viewer (Ctrl-C to exit)
 
         t = threading.Thread(target=_train, daemon=False, name="ttgs-training")
         t.start()

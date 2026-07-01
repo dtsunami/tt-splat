@@ -123,6 +123,10 @@ function initRunBar(id) {
   // ── Status row ──
   h += '<div class="rb-status">';
   h += '<span class="rb-dot" id="rb-dot"></span>';
+  h += '<span class="rb-state" id="rb-state" style="font:11px monospace;padding:2px 8px;border:1px solid #444;'
+     + 'border-radius:10px;margin-left:2px;white-space:nowrap;display:none"></span>';
+  h += '<span class="rb-event" id="rb-event" style="font:10px monospace;color:#888;margin-left:8px;max-width:340px;'
+     + 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>';
 
   h += '<div class="rb-metric">';
   h += '  <span class="rb-label">Step</span>';
@@ -283,6 +287,27 @@ function updateRunBar(d) {
   if (btn) {
     btn.textContent = d.is_paused ? 'Resume' : 'Pause';
     btn.className = d.is_paused ? 'rb-pause paused' : 'rb-pause';
+  }
+
+  // ── Train lifecycle status + recent events (so a stop/fail isn't a silent freeze) ──
+  const ts = d.train_status || {};
+  const stEl = $('rb-state');
+  if (stEl) {
+    const state = d.is_paused ? 'paused' : (ts.state || 'running');
+    const COL = {running:'#4f8', paused:'#fb4', done:'#4af', diverged:'#f66', failed:'#f44', idle:'#666'};
+    const c = COL[state] || '#aaa';
+    stEl.style.display = '';
+    stEl.textContent = state.toUpperCase() + (ts.message && state !== 'running' ? ' · ' + ts.message : '');
+    stEl.style.color = c; stEl.style.borderColor = c;
+    // pulse the dashboard's attention on a hard stop
+    stEl.style.background = (state === 'failed' || state === 'diverged') ? 'rgba(255,80,80,0.12)' : 'transparent';
+  }
+  const evEl = $('rb-event');
+  if (evEl) {
+    const ev = d.train_events || [];
+    const last = ev.length ? ev[ev.length - 1] : null;
+    const ICON = {skip:'⏭', ckpt:'💾', diverged:'✖', error:'✖'};
+    evEl.textContent = last ? `${ICON[last.kind] || '·'} @${last.step} ${last.message}` : '';
   }
 
   // Track elapsed time
@@ -496,30 +521,8 @@ function initPipelineControls(id, opts) {
      + ' data-tip="Write the current model to splat.ply right now. Works in every mode. (Set a Checkpoint Interval for periodic auto-saves.)">Save Checkpoint</button>';
   h += '</div>';
 
-  // ── Camera Pose-Opt: interactive "grab the ghosting camera and nudge" ──
-  h += '<div class="ctrl-section"><h3>Camera Pose'
-     + '<a class="explain-link" href="/docs/controls.html" target="_blank" title="Camera pose optimization">ⓘ explain</a></h3>';
-  h += '<div class="pose-note" data-tip-title="Pose nudge" data-tip-badge="live"'
-     + ' data-tip="Manually shift the CURRENT camera\'s extrinsics — the interactive ‘grab the ghosting camera and nudge it’ handle that absorbs COLMAP pose error. Requires Pose-Opt ON: set on=1 in the Camera Pose-Opt config group (run bar / Edit). Each click applies ±step to one axis. ω = rotation (rad), t = translation (world units).">'
-     + 'Nudges the <b>current</b> camera. Needs Pose-Opt <b>on</b> (config group).</div>';
-  h += '<div class="ctrl-field">';
-  h += '  <label data-tip-title="Nudge step" data-tip="Per-click magnitude. ω in radians (0.01 ≈ 0.57°), t in world units.">nudge step <span class="ctrl-value" id="pose-step-val">0.010</span></label>';
-  h += '  <input type="range" id="pose-step" min="0.001" max="0.1" step="0.001" value="0.01"';
-  h += '         oninput="document.getElementById(\'pose-step-val\').textContent=parseFloat(this.value).toFixed(3)">';
-  h += '</div>';
-  h += '<div class="pose-grid">';
-  var _poseAx = ['x', 'y', 'z'];
-  for (var _pk = 0; _pk < 2; _pk++) {
-    var _kind = _pk === 0 ? 'omega' : 'trans';
-    var _sym  = _pk === 0 ? 'ω' : 't';                 // ω | t
-    for (var _ax = 0; _ax < 3; _ax++) {
-      h += '<span class="pose-lbl">' + _sym + _poseAx[_ax] + '</span>';
-      h += '<button class="pose-btn" onclick="poseNudge(\'' + _kind + '\',' + _ax + ',-1)">−</button>';
-      h += '<button class="pose-btn" onclick="poseNudge(\'' + _kind + '\',' + _ax + ',1)">+</button>';
-    }
-  }
-  h += '</div>';
-  h += '</div>';
+  // Camera pose nudging now lives on the render (🎮 Drive) and the /pose page —
+  // removed from the left nav to keep the sidebar clean.
 
   if (opts.image) {
     h += '<div class="ctrl-section"><h3>This Image</h3>';

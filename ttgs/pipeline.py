@@ -145,8 +145,10 @@ def run(
                 dashboard=None,
             )
     except Exception as exc:
+        import traceback
         result.error = str(exc)
         console.print(f"[bold red]train failed:[/] {exc}")
+        console.print(f"[dim]{traceback.format_exc()}[/]")   # surface the location, not just the message
         return result
 
     # ── Stage 4: Export ──────────────────────────────────────────────────────

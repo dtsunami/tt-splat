@@ -59,8 +59,10 @@
 
     /* ── loss chart strip at bottom of canvas ── */
     #chart-strip {
-      height: 120px; flex-shrink: 0; background: #0e0e0e;
+      height: 168px; flex-shrink: 0; background: #0e0e0e;
       border-top: 1px solid #222; position: relative;
+      resize: vertical; overflow: hidden;
+      min-height: 110px; max-height: 70vh;
     }
     #chart-strip .panel-label {
       position: absolute; top: 4px; left: 10px; z-index: 1;
@@ -205,7 +207,7 @@
       <div class="panel-label"><b>Loss</b>
         <span class="muted small" style="cursor:pointer;margin-left:8px" onclick="toggleChartMode();" id="chart-mode-btn">all cameras</span>
       </div>
-      <canvas id="loss-chart" width="800" height="120" style="width:100%;height:100%;background:#0e0e0e"></canvas>
+      <canvas id="loss-chart" width="800" height="168" style="width:100%;height:100%;background:#0e0e0e"></canvas>
     </div>
   </div>
 </div>
@@ -630,7 +632,11 @@ async function tick() {
     if (++_chartTick % 4 === 0) {
       const cam = _chartMode === 'camera' ? IMAGE_NAME : '';
       const history = await fetchHistory(cam);
-      if (history.length) drawLossChart('loss-chart', history, {highlight: IMAGE_NAME});
+      if (history.length) drawLossChart('loss-chart', history, {
+        highlight: IMAGE_NAME,
+        // Click a marker → jump the editor to that camera's image.
+        onPick: (name) => { if (name && name !== IMAGE_NAME) location.href = '/images/' + encodeURIComponent(name) + '/edit'; },
+      });
     }
 
     // Poll frames.json for real-time updates (every ~2s)

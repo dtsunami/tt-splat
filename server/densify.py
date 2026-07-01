@@ -48,30 +48,62 @@ def spawn_gaussians(P, means, colors, *, scale_log=None, op_prob=0.12):
 
 
 def densify_3d(P, gpos, *, grad_threshold=0.0, prune_op=0.005, prune_big_mult=20.0,
-               split_world=0.0, clone_jitter=0.02, n_max=200_000):
+               split_world=0.0, clone_jitter=0.02, n_max=200_000,
+               max_growth=0.5, min_keep_frac=0.05, min_log_scale=-9.0,
+               guard=False, prune_floor_eps=0.5):
     """P: dict of torch tensors (leading dim N).  gpos: torch [N] (interval-averaged).
-    Returns (newP, stats) where stats = {clone, split, prune, n_before, n_after}.
-    Safeguard: prune_big_mult>0 also prunes fog-blobs whose world size exceeds that multiple of the
-    median (the floater/over-large cull that keeps densification from diverging)."""
+    Returns (newP, stats) where stats = {clone, split, prune, n_before, n_after[, diverged]}.
+
+    SAFETY RAILS (a degenerate densify can prune to N=0 and SIGFPE the device, or shrink split children
+    into NaN-producing conics — both observed on real runs):
+      • DIVERGENCE: if any param is non-finite, return P UNCHANGED + {diverged:True}. Densify on NaN
+        computes keep=all-False (sigmoid(NaN)>thr is False) and nukes the whole model → empty-tensor crash.
+      • KEEP-FLOOR: never prune below min_keep_frac·N in one cycle (keep the top-opacity instead).
+      • GROWTH-CAP: at most max_growth·N new Gaussians per cycle (keep the highest-grad candidates).
+      • SCALE-FLOOR: split children clamp log-scale ≥ min_log_scale so repeated splits can't make
+        degenerate (conic-overflow → NaN) Gaussians.
+    Plus prune_big_mult>0 prunes fog-blobs whose world size exceeds that multiple of the median."""
     keys = [k for k in _KEYS if k in P]
     with torch.no_grad():
         N = P["mean"].shape[0]
-        op = torch.sigmoid(P["op"].reshape(N).float())
+        op_raw = P["op"].reshape(N).float()
+        if not (torch.isfinite(op_raw).all() and torch.isfinite(P["scale"]).all()
+                and torch.isfinite(P["mean"]).all()):          # DIVERGENCE guard — bail UNCHANGED, don't nuke
+            newP = {k: P[k].detach().clone() for k in keys}
+            if "deg" in P:
+                newP["deg"] = P["deg"]
+            return newP, {"clone": 0, "split": 0, "prune": 0, "n_before": N, "n_after": N, "diverged": True}
 
+        op = torch.sigmoid(op_raw)
         scale = P["scale"]
         world = torch.exp(scale.float())
         world = world.max(dim=1).values if world.dim() == 2 else world      # largest axis (world units)
+        med = float(world.median())
         keep = op > prune_op                                  # PRUNE low-opacity floaters
-        if prune_big_mult and prune_big_mult > 0:             # + PRUNE over-large fog blobs (scale safeguard)
-            keep = keep & (world < float(prune_big_mult) * float(world.median()))
+        if prune_big_mult and prune_big_mult > 0 and med > 0:  # + PRUNE over-large fog blobs (scale safeguard)
+            keep = keep & (world < float(prune_big_mult) * med)
+        if guard:                                             # #2: PRUNE fully-collapsed splats — even the largest axis is
+            maxlog = scale.max(dim=1).values if scale.dim() == 2 else scale.reshape(N)   # pinned at the scale floor ⇒
+            keep = keep & (maxlog > (float(min_log_scale) + float(prune_floor_eps)))     # degenerate sub-pixel (conic → NaN)
+        if int(keep.sum()) < max(1, int(min_keep_frac * N)):  # KEEP-FLOOR — never collapse the model
+            topk = torch.topk(op, max(1, min(N, int(min_keep_frac * N)))).indices
+            keep = torch.zeros(N, dtype=torch.bool); keep[topk] = True
+
         tau = float(grad_threshold) if grad_threshold and grad_threshold > 0 else \
             float(gpos.mean() + gpos.std())
-        big = world > (float(split_world) if split_world and split_world > 0
-                       else float(world.median()) * 1.5)
+        big = world > (float(split_world) if split_world and split_world > 0 else med * 1.5)
         grad_hi = gpos.reshape(N) > tau
 
         do_clone = keep & grad_hi & (~big)                    # CLONE small high-grad
         do_split = keep & grad_hi & big                       # SPLIT large high-grad
+        if max_growth and max_growth > 0:                     # GROWTH-CAP — bound new Gaussians per cycle
+            cand = do_clone | do_split
+            budget = int(max_growth * N)
+            if int(cand.sum()) > budget:
+                ci = cand.nonzero(as_tuple=True)[0]
+                drop = ci[torch.argsort(gpos.reshape(N)[ci], descending=True)[budget:]]
+                m = torch.ones(N, dtype=torch.bool); m[drop] = False
+                do_clone = do_clone & m; do_split = do_split & m
         survive = keep & (~do_split)                          # clone keeps original; split consumes it
 
         sidx = survive.nonzero(as_tuple=True)[0]
@@ -91,7 +123,7 @@ def densify_3d(P, gpos, *, grad_threshold=0.0, prune_op=0.005, prune_big_mult=20
                 for _ in range(2):
                     v = P[k][spidx].clone()
                     if k == "scale":
-                        v = v - _LOG16                         # /1.6 in log-space
+                        v = (v - _LOG16).clamp(min=min_log_scale)   # /1.6 in log-space; SCALE-FLOOR vs degenerate splits
                     elif k == "mean":
                         v = v + torch.randn_like(v.float()).to(v.dtype) * ext
                     parts.append(v)
@@ -106,6 +138,11 @@ def densify_3d(P, gpos, *, grad_threshold=0.0, prune_op=0.005, prune_big_mult=20
 
         for k in keys:                                        # detach + contiguous for re-leafing / device upload
             newP[k] = newP[k].detach().clone()
+        if guard:                                             # #2: keep quaternions UNIT — a zero-norm child quat makes
+            q = newP["quat"].float()                          # recip(|q|)=inf in the Stage D backward (the qnorm divide)
+            qn = q.norm(dim=1, keepdim=True)
+            ident = torch.zeros_like(q); ident[:, 0] = 1.0    # degenerate → identity rotation
+            newP["quat"] = torch.where(qn > 1e-8, q / qn.clamp_min(1e-8), ident).to(P["quat"].dtype)
         if "deg" in P:
             newP["deg"] = P["deg"]
         stats = {"clone": int(do_clone.sum()), "split": int(do_split.sum()),

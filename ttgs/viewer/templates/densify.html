@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ttgs — densification</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/base.css">
+  <style>
+    #main { display: flex; flex: 1; overflow: hidden; }
+    #dn-chart-strip { height: 150px; flex-shrink: 0; background: #0e0e0e; border-top: 1px solid #2a2a2a; position: relative; }
+    #dn-chart { width: 100%; height: 100%; }
+    #dn-side { width: 300px; background: #141414; border-left: 1px solid #282828; overflow-y: auto; flex-shrink: 0; }
+    .dn-stats { display: flex; gap: 8px; padding: 10px; }
+    .dn-stat { flex: 1; background: #161616; border: 1px solid #282828; border-radius: 8px; padding: 8px 10px; }
+    .dn-stat .k { color: #888; font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+    .dn-stat .v { color: #4f4; font-size: 22px; font-weight: bold; font-family: monospace; }
+    .dn-stat .sub { color: #777; font-size: 10px; font-family: monospace; }
+    #dn-feed { font: 11px/1.6 monospace; padding: 4px 10px 12px; max-height: 220px; overflow-y: auto; }
+    .dn-evt { display: flex; justify-content: space-between; padding: 3px 6px; border-bottom: 1px solid #1e1e1e; }
+    .dn-evt .gain { color: #4f4; } .dn-evt .step { color: #888; }
+    .dn-help { color: #888; font-size: 11px; line-height: 1.5; padding: 0 10px 12px; }
+    .dn-help b { color: #4f4; }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <a href="/"><b>ttgs</b></a> <span class="sep">|</span>
+  <a href="/training">training</a> <span class="sep">|</span>
+  <a href="/pose">🎮 pose</a> <span class="sep">|</span>
+  <b>🌱 densify</b> <span class="sep">|</span>
+  <a href="/docs/controls.html" target="_blank" title="Every control & knob, explained">🎛️ controls</a>
+  <span class="spacer"></span>
+  <span class="poll-status" id="poll-status">waiting...</span>
+</div>
+
+<div class="run-bar" id="run-bar"></div>
+
+<div id="main">
+  <div id="center">
+    <!-- render / GT / error-surface, with the bubble gun on the render -->
+    <div id="preview-row">
+      <div class="preview-cell" id="render-cell">
+        <div class="preview-label"><b>Render</b> <span class="muted small" id="dn-cam">--</span>
+          <span class="spacer"></span>
+          <span class="splat-bar" id="splat-bar" title="Bubble gun (Slime Rancher): spray new splats where detail is missing, or vacuum floaters/fog. Aim on the render, click-drag to fire.">
+            <span class="splat-btn" id="splat-toggle" onclick="splatToggle()">🫧 Splat tool</span>
+            <span class="splat-mode">
+              <span class="splat-seg sel" id="splat-add" onclick="splatSetMode('add')">🫧 add</span>
+              <span class="splat-seg rm" id="splat-remove" onclick="splatSetMode('remove')">🧹 erase</span>
+              <label>brush <input type="range" id="splat-brush" min="2" max="60" value="8" style="width:64px;vertical-align:middle"></label>
+            </span>
+          </span>
+        </div>
+        <div class="no-data" id="render-ph">waiting for training…</div>
+        <img id="render-img" />
+        <canvas id="splat-overlay"></canvas>
+      </div>
+      <div class="preview-cell">
+        <div class="preview-label"><b>Ground Truth</b></div>
+        <div class="no-data" id="gt-ph">--</div>
+        <img id="gt-img" />
+      </div>
+      <div class="preview-cell">
+        <div class="preview-label"><b>Error surface</b> <span class="muted small">bright = wrong → aim the gun here</span></div>
+        <div class="no-data" id="diff-ph">--</div>
+        <img id="diff-img" />
+      </div>
+    </div>
+    <!-- gaussian count over time -->
+    <div id="dn-chart-strip"><canvas id="dn-chart"></canvas></div>
+  </div>
+
+  <div id="dn-side">
+    <div class="dn-stats">
+      <div class="dn-stat"><div class="k">Gaussians</div><div class="v" id="dn-n">--</div><div class="sub" id="dn-n-sub">&nbsp;</div></div>
+      <div class="dn-stat"><div class="k">Last</div><div class="v" id="dn-last" style="font-size:15px">--</div><div class="sub" id="dn-last-sub">&nbsp;</div></div>
+      <div class="dn-stat"><div class="k">Added</div><div class="v" id="dn-added">--</div><div class="sub">c+s</div></div>
+    </div>
+
+    <div class="ctrl-section"><h3>Human-assisted densify</h3></div>
+    <div class="dn-help" style="padding:0 10px 8px">
+      Hit <b>🫧 Splat tool</b> on the render, then drag over the <b>error surface</b>'s bright spots to spray
+      splats where the model is missing detail — or <b>🧹 erase</b> to vacuum floaters/fog.
+    </div>
+
+    <div class="ctrl-section"><h3>Operations</h3></div>
+    <div style="padding:0 10px 10px">
+      <button class="ctrl-lg" onclick="postCommand('densify_now')"
+        data-tip-title="Densify now" data-tip-badge="both"
+        data-tip="Clone/split high-gradient Gaussians + prune floaters right now.">🌱 Densify now</button>
+      <div class="ctrl-field">
+        <label data-tip="Prune removes Gaussians whose opacity is below this.">prune opacity <span class="ctrl-value" id="prune-val">0.005</span></label>
+        <input type="range" id="prune-thresh" min="0.001" max="0.1" step="0.001" value="0.005"
+               oninput="document.getElementById('prune-val').textContent=parseFloat(this.value).toFixed(3)">
+      </div>
+      <button class="ctrl-lg danger" onclick="pruneGaussians()" data-tip-badge="both" data-tip-title="Prune"
+        data-tip="Delete every Gaussian below the opacity threshold.">🧹 Prune</button>
+      <button class="ctrl-lg" onclick="postCommand('reset_opacities')" data-tip-badge="both" data-tip-title="Reset opacities"
+        data-tip="Push all opacities near zero so each must re-earn visibility — a strong floater killer.">Reset opacities</button>
+      <button class="ctrl-lg" onclick="postCommand('clamp_scale',{max_log_scale:2.5})" data-tip-badge="both" data-tip-title="Clamp scale"
+        data-tip="Cap each Gaussian's log-scale to kill long needle/spike artifacts.">Clamp scale</button>
+    </div>
+
+    <div class="ctrl-section"><h3>Densify events</h3></div>
+    <div id="dn-feed"><span class="muted small">no densify events yet…</span></div>
+
+    <div class="dn-help">
+      Auto-densify runs clone/split/prune on the <b>from / until / every</b> schedule in the run bar; tune
+      those + <b>grad</b> (0 = adaptive) there. If <b>clone/split stay 0</b> it'll say why (no signal / diverged).
+    </div>
+  </div>
+</div>
+
+<script src="/static/base.js"></script>
+<script src="/static/components.js"></script>
+<script src="/static/splat.js"></script>
+<script>
+  let _currentCam = null;                    // the camera the render belongs to — used by the bubble gun
+  const ps = document.getElementById('poll-status');
+  if (typeof initRunBar === 'function') initRunBar('run-bar');
+  if (typeof initTooltips === 'function') initTooltips();
+
+  function drawNChart(hist){
+    const cv=document.getElementById('dn-chart'); if(!cv) return;
+    const wrap=document.getElementById('dn-chart-strip').getBoundingClientRect();
+    cv.width=Math.max(2,Math.round(wrap.width)); cv.height=Math.max(2,Math.round(wrap.height));
+    const ctx=cv.getContext('2d'), W=cv.width, H=cv.height, pad={l:54,r:10,t:14,b:20};
+    ctx.fillStyle='#0e0e0e'; ctx.fillRect(0,0,W,H);
+    const pts=hist.filter(e=>e.n_gaussians!=null).map(e=>({s:e.step,n:e.n_gaussians}));
+    if(pts.length<2){ ctx.fillStyle='#555'; ctx.font='12px monospace'; ctx.fillText('waiting for training…',pad.l,30); return; }
+    const xs=pts.map(p=>p.s), ns=pts.map(p=>p.n);
+    const x0=Math.min(...xs), x1=Math.max(...xs), n0=Math.min(...ns), n1=Math.max(...ns);
+    const cw=W-pad.l-pad.r, ch=H-pad.t-pad.b;
+    const tx=s=>pad.l+(s-x0)/Math.max(x1-x0,1)*cw, ty=n=>pad.t+(1-(n-n0)/Math.max(n1-n0,1))*ch;
+    ctx.strokeStyle='#222'; ctx.fillStyle='#666'; ctx.font='10px monospace'; ctx.textAlign='right';
+    for(let i=0;i<=4;i++){ const v=n0+(n1-n0)*i/4, y=ty(v); ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke(); ctx.fillText(Math.round(v).toLocaleString(),pad.l-4,y+3); }
+    ctx.textAlign='center';
+    for(let i=0;i<=4;i++){ const s=x0+(x1-x0)*i/4; ctx.fillText(Math.round(s).toLocaleString(),tx(s),H-5); }
+    ctx.strokeStyle='#4f4'; ctx.lineWidth=2; ctx.beginPath();
+    pts.forEach((p,i)=>{ const x=tx(p.s),y=ty(p.n); i?ctx.lineTo(x,y):ctx.moveTo(x,y); }); ctx.stroke();
+    ctx.fillStyle='#4f4'; ctx.textAlign='left'; ctx.fillText('Gaussian count',pad.l,11);
+  }
+
+  async function fetchDensifyLog(){
+    try{ const r=await fetch('/densify/log'); return r.ok? await r.json():[]; }catch(e){ return []; }
+  }
+  function renderFeed(log){
+    const el=document.getElementById('dn-feed');
+    if(!log.length){ el.innerHTML='<span class="muted small">no densify events yet…</span>'; return 0; }
+    let added=0; let h='';
+    for(const e of log.slice(-40).reverse()){
+      const gain=(e.n_after||0)-(e.n_before||0);
+      h+=`<div class="dn-evt"><span class="step">@${e.step.toLocaleString()}</span>`
+       + `<span>c${e.clone} s${e.split} p${e.prune}</span>`
+       + `<span class="gain">${gain>=0?'+':''}${gain}</span></div>`;
+    }
+    for(const e of log){ added += (e.clone||0) + (e.split||0); }
+    el.innerHTML=h; return added;
+  }
+
+  let _tick=0;
+  async function tick(){
+    try{
+      const d=await pollState();
+      try{ if(typeof updateRunBar==='function') updateRunBar(d); }catch(e){}
+      if(d){
+        ps.textContent='live'; ps.className='poll-status ok';
+        _currentCam = d.camera_name || null;
+        if(typeof setImg==='function'){ setImg('render-img','render-ph',d.render_b64); setImg('gt-img','gt-ph',d.gt_b64); setImg('diff-img','diff-ph',d.diff_b64); }
+        document.getElementById('dn-cam').textContent=d.camera_name? ('· '+d.camera_name):'';
+        document.getElementById('dn-n').textContent=(d.n_gaussians||0).toLocaleString();
+        document.getElementById('dn-n-sub').textContent='step '+(d.step||0).toLocaleString();
+      } else { ps.textContent='idle'; ps.className='poll-status'; }
+      if(++_tick%2===0){
+        const hist=await fetchHistory(); if(hist.length) drawNChart(hist);
+        const log=await fetchDensifyLog(); const added=renderFeed(log);
+        document.getElementById('dn-added').textContent='+'+added.toLocaleString();
+        if(log.length){ const e=log[log.length-1];
+          document.getElementById('dn-last').textContent=`c${e.clone} s${e.split} p${e.prune}`;
+          document.getElementById('dn-last-sub').textContent=`@${e.step.toLocaleString()}: ${e.n_before.toLocaleString()}→${e.n_after.toLocaleString()}`;
+        }
+      }
+    }catch(e){ console.warn('tick:',e); }
+  }
+  tick(); setInterval(tick,500);
+</script>
+</body>
+</html>

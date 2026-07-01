@@ -355,6 +355,10 @@ def blackhole(
     profile: bool = typer.Option(False, "--profile",
                                  help="Stream live per-step device compute-utilization into the stage telemetry "
                                       "(enables the tt-metal device profiler; implies --device-resident)"),
+    debug: bool = typer.Option(False, "--debug",
+                               help="Per-step numerical-stability telemetry: prints |max| of projection (u/zc/conic), "
+                                    "2D & 3D gradients, and params, flagging the FIRST non-finite quantity so a "
+                                    "divergence is traceable to its source stage straight from the log"),
 ) -> None:
     """[bold]Train on Tenstorrent Blackhole[/] — the ttgs dashboard driving the TT pipeline.
 
@@ -388,6 +392,8 @@ def blackhole(
         env["TT_DEVICE_TRAIN"] = "1"         # train_tt runs fwd+bwd gradients on-device (small scale)
     if device_resident:
         env["TT_DEVICE_RESIDENT"] = "1"      # full device-resident loop + per-stage telemetry
+    if debug:
+        env["TT_DEBUG"] = "1"                # per-step finite-stats telemetry (numerical-stability triage)
     if profile:
         env["TT_PROFILE"] = "1"                       # live per-step device compute-util
         env["TT_METAL_DEVICE_PROFILER"] = "1"         # firmware kernel-zone capture (tree is profiler-enabled)

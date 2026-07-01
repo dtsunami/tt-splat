@@ -22,6 +22,13 @@ from fused_backward import (READER as BR, COMPUTE as BC, WRITER as BW, f2u, FUSE
 
 _GEOM = ("cx", "cy", "a", "b", "c", "op")
 NB = TS * TS * 4
+# Cap the per-core drain-once accumulator at _MAXNB chunk-tiles. out_acc holds `nbatch` tiles/core where
+# nbatch = ceil(densest_tile_gaussians / FUSED_K); after heavy densification a single tile can hold thousands
+# of Gaussians, so a full-nbatch accumulator overflows worker L1 into the static circular-buffer region
+# (the "circular buffers ... clash with L1 buffers ... program N" TT_THROW). Draining in <=_MAXNB-chunk
+# windows bounds L1; the S/T recurrence threads across windows so the result is bit-identical. 64 tiles =
+# 256 KB/core, far under the ~1.2 MB of free worker L1. Override with TT_FB_MAXNB.
+_MAXNB = max(1, int(os.environ.get("TT_FB_MAXNB", "64")))
 
 
 def usable_grid(dev):
@@ -168,7 +175,6 @@ def fused_backward_blocked(dev, cx, cy, a, b2, c, op, colv, tile_lists, ntx, nty
         nbatch = max(1, (maxc + FUSED_K - 1) // FUSED_K)
         ones_t = _tileshard(dev, grid, ncores, 1, torch.ones(ncores * TS, TS))    # s4 matmul-reduce ones
         for ch in range(3):
-            out_acc = _tileshard(dev, grid, ncores, nbatch)                       # drain-once accumulator (chunk c -> tile c)
             dl = np.zeros((ncores * TS, TS), np.float32)
             for local, t in enumerate(bt):
                 tx, ty = t % ntx, t // ntx
@@ -176,44 +182,52 @@ def fused_backward_blocked(dev, cx, cy, a, b2, c, op, colv, tile_lists, ntx, nty
             dLt = _tileshard(dev, grid, ncores, 1, torch.from_numpy(dl))
             Tt = _tileshard(dev, grid, ncores, 1, torch.from_numpy(Tt0.copy()))
             St = _tileshard(dev, grid, ncores, 1, torch.zeros(ncores * TS, TS))
-            for d in range(nbatch):
-                Sout = _tileshard(dev, grid, ncores, 1); Tout = _tileshard(dev, grid, ncores, 1)
-                toff = d * (TS * TS)
-                rt_r, rt_c, rt_w = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
-                for gx in range(mx):
-                    for gy in range(my):
-                        local = gy * mx + gx
-                        sx, sy = coords[(gx, gy)]
-                        w = np.tile(d8, (FUSED_K, 1))      # [FUSED_K,8] DUMMY-filled
-                        if local < len(bt):
-                            lst = tile_lists[bt[local]][::-1][d * FUSED_K:(d + 1) * FUSED_K]
-                            if lst:
-                                g = np.asarray(lst); L = len(g)
-                                w[:L, 0] = cxu[g]; w[:L, 1] = cyu[g]; w[:L, 2] = au[g]; w[:L, 3] = twobu[g]
-                                w[:L, 4] = cu[g]; w[:L, 5] = opu[g]; w[:L, 6] = colvu[ch][g]; w[:L, 7] = bu[g]
-                        rt_r[gx][gy] = [sx, sy, PXt.buffer_address(), PYt.buffer_address(), dLt.buffer_address(),
-                                        Tt.buffer_address(), St.buffer_address(), NB, FUSED_K,
-                                        ones_t.buffer_address(), Sout.buffer_address(), Tout.buffer_address()]
-                        rt_c[gx][gy] = w.reshape(-1).tolist()
-                        rt_w[gx][gy] = [sx, sy, NB, FUSED_K, out_acc.buffer_address(), toff]
-                prog = ttnn.ProgramDescriptor(kernels=[
-                    ks(READER_RF, rt_r, ttnn.ReaderConfigDescriptor()),
-                    ks(COMPUTE_RF, rt_c, ttnn.ComputeConfigDescriptor(), [FUSED_K]),
-                    ks(WRITER_S4, rt_w, ttnn.WriterConfigDescriptor())],
-                    semaphores=[], cbs=[cbf(i, 2) for i in (0, 1, 2, 5, 6, 24, 25, 26, 27)]
-                                       + [cbf(i, 2) for i in range(8, 15)] + [cbf(i, 3) for i in range(16, 23)])
-                ttnn.generic_op([PXt, out_acc], prog)
-                St, Tt = Sout, Tout
-            tt = ttnn.to_torch(out_acc).reshape(ncores, nbatch, TS, TS)           # drain ONCE per channel (scalars, no full-tile readback)
-            for local, t in enumerate(bt):
-                rev = tile_lists[t][::-1]; L = len(rev)
-                if not L:
-                    continue
-                idx = np.asarray(rev)
-                blk = tt[local, :, :FUSED_K, :].reshape(nbatch * FUSED_K, TS)     # row c*FUSED_K+g = reversed gid
-                for gi_i, name in enumerate(_NAMES):
-                    vals = blk[:L, gi_i * 4].numpy()
-                    (colg[ch] if name == "col" else geomg[name])[idx] += vals
-            out_acc.deallocate()
+            # drain in <=_MAXNB-chunk windows (L1 cap, see _MAXNB note). S/T recurrence threads across windows.
+            for g0 in range(0, nbatch, _MAXNB):
+                grp = min(_MAXNB, nbatch - g0)
+                out_acc = _tileshard(dev, grid, ncores, grp)                       # window accumulator (chunk j -> tile j)
+                for j in range(grp):
+                    d = g0 + j
+                    Sout = _tileshard(dev, grid, ncores, 1); Tout = _tileshard(dev, grid, ncores, 1)
+                    toff = j * (TS * TS)                                           # slot within this window
+                    rt_r, rt_c, rt_w = ttnn.RuntimeArgs(), ttnn.RuntimeArgs(), ttnn.RuntimeArgs()
+                    for gx in range(mx):
+                        for gy in range(my):
+                            local = gy * mx + gx
+                            sx, sy = coords[(gx, gy)]
+                            w = np.tile(d8, (FUSED_K, 1))      # [FUSED_K,8] DUMMY-filled
+                            if local < len(bt):
+                                lst = tile_lists[bt[local]][::-1][d * FUSED_K:(d + 1) * FUSED_K]
+                                if lst:
+                                    g = np.asarray(lst); L = len(g)
+                                    w[:L, 0] = cxu[g]; w[:L, 1] = cyu[g]; w[:L, 2] = au[g]; w[:L, 3] = twobu[g]
+                                    w[:L, 4] = cu[g]; w[:L, 5] = opu[g]; w[:L, 6] = colvu[ch][g]; w[:L, 7] = bu[g]
+                            rt_r[gx][gy] = [sx, sy, PXt.buffer_address(), PYt.buffer_address(), dLt.buffer_address(),
+                                            Tt.buffer_address(), St.buffer_address(), NB, FUSED_K,
+                                            ones_t.buffer_address(), Sout.buffer_address(), Tout.buffer_address()]
+                            rt_c[gx][gy] = w.reshape(-1).tolist()
+                            rt_w[gx][gy] = [sx, sy, NB, FUSED_K, out_acc.buffer_address(), toff]
+                    prog = ttnn.ProgramDescriptor(kernels=[
+                        ks(READER_RF, rt_r, ttnn.ReaderConfigDescriptor()),
+                        ks(COMPUTE_RF, rt_c, ttnn.ComputeConfigDescriptor(), [FUSED_K]),
+                        ks(WRITER_S4, rt_w, ttnn.WriterConfigDescriptor())],
+                        semaphores=[], cbs=[cbf(i, 2) for i in (0, 1, 2, 5, 6, 24, 25, 26, 27)]
+                                           + [cbf(i, 2) for i in range(8, 15)] + [cbf(i, 3) for i in range(16, 23)])
+                    ttnn.generic_op([PXt, out_acc], prog)
+                    St, Tt = Sout, Tout
+                tt = ttnn.to_torch(out_acc).reshape(ncores, grp, TS, TS)          # drain this window (scalars)
+                base = g0 * FUSED_K                                                # reversed-gid offset of window
+                for local, t in enumerate(bt):
+                    rev = tile_lists[t][::-1]; L = len(rev)
+                    if L <= base:                                                 # tile fully drained by prior windows
+                        continue
+                    idx = np.asarray(rev)
+                    avail = min(L - base, grp * FUSED_K)
+                    blk = tt[local, :, :FUSED_K, :].reshape(grp * FUSED_K, TS)    # row = base + (chunk*FUSED_K+slot)
+                    sl = idx[base:base + avail]
+                    for gi_i, name in enumerate(_NAMES):
+                        vals = blk[:avail, gi_i * 4].numpy()
+                        (colg[ch] if name == "col" else geomg[name])[sl] += vals
+                out_acc.deallocate()
         ones_t.deallocate(); PXt.deallocate(); PYt.deallocate()
     return geomg, colg

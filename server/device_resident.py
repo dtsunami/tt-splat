@@ -58,6 +58,24 @@ class DeviceResidentTrainer:
         self.sh_interval = int(sh_interval)        # progressive-SH: steps per band (0 = full deg, warmup off)
         self.deg_eff = self.deg                    # effective SH degree this step (ramps under warmup)
         self.aa = bool(aa)                         # Mip-Splatting anti-alias opacity compensation
+        self.near_frac = float(os.environ.get("TT_NEAR_FRAC", "0.05"))   # near-plane cull = frac × median scene depth
+        self.debug = int(os.environ.get("TT_DEBUG", "0"))   # --debug: per-step finite-stats triage (see step())
+        self.grad_clip = float(os.environ.get("TT_GRAD_CLIP", "10.0"))   # clip 2D grads pre-Stage-D (anti-divergence; 0=off)
+        self.proj_sanitize = os.environ.get("TT_PROJ_SANITIZE", "1") == "1"  # #1: source-side floors in project_backward (default ON)
+        self.skip_on_nan = os.environ.get("TT_SKIP_STEP", "1") == "1"        # #3: skip a step on non-finite loss, don't abort (default ON)
+        self._skips = 0                            # consecutive skipped (non-finite) steps — patience counter
+        self.skip_patience = int(os.environ.get("TT_SKIP_PATIENCE", "16"))   # give up after this many in a row
+        # Device D-SSIM loss — runs the L1+D-SSIM loss & dL/dimage on the Blackhole (matmul-blur), killing the
+        # ~300-420ms/step host SSIM at high res. On unless TT_DSSIM_DEVICE=0; masked frames / lambda_dssim<=0
+        # fall back to the host autograd path transparently. See dssim_device.py.
+        self.dssim_dev = None
+        if self.lambda_dssim > 0 and int(os.environ.get("TT_DSSIM_DEVICE", "1")):
+            try:
+                from dssim_device import DeviceDSSIM
+                self.dssim_dev = DeviceDSSIM(dev)
+                print("  [resident] device D-SSIM loss ON (matmul-blur; TT_DSSIM_DEVICE=0 to use host)")
+            except Exception as exc:
+                print(f"  [resident] device D-SSIM unavailable ({type(exc).__name__}: {exc}); host loss path")
         self.last_screen = None                    # last step's per-Gaussian (u,v,zc,du,dv,valid) for pose-opt
         init = {k: P[k].detach().clone() for k in ("mean", "scale", "quat", "op", "sh")}
         self.K = init["sh"].shape[1]
@@ -66,6 +84,14 @@ class DeviceResidentTrainer:
         self.timings = {k: 0.0 for k in ("B", "bin", "raster", "loss", "A", "D", "C", "step")}
         self.nstep = 0
         self.N = int(init["mean"].shape[0])   # live Gaussian count (mutated by prune)
+        # SCALE BAND (anti-degenerate): the device raster/backward use the RAW conic with no screen-space
+        # low-pass, so a sub-pixel Gaussian (e.g. a split child) gives conic ~1/scale^2 -> exploding position
+        # gradients -> mean blows to ±inf -> NaN loss. Until a proper 2D low-pass lands, keep every scale in a
+        # scene-relative band [med-band, med+band] (clamped each step + used as the split floor). 0 = disabled.
+        _smed = float(init["scale"].float().median())
+        _band = float(os.environ.get("TT_SCALE_BAND", "4.0"))     # e^4 ≈ 55x each way (~3000x total range)
+        self.scale_lo = (_smed - _band) if _band > 0 else None
+        self.scale_hi = (_smed + _band) if _band > 0 else None
         self.step_log = []          # per-step {stage: ms} — for profiling the ramp/stall curve
         self._gpos = np.zeros(self.N, dtype=np.float64)   # accumulated 2D positional-grad magnitude (densify signal)
         self._gacc = 0
@@ -122,7 +148,13 @@ class DeviceResidentTrainer:
         # ===== bin/sort (host, deferred) + cull =====
         TS = M14.TS
         Wp, Hp = ((W + TS - 1) // TS) * TS, ((H + TS - 1) // TS) * TS
-        valid = zc > 1e-4
+        # NEAR-PLANE CULL (the real anti-NaN fix): a Gaussian with zc just above 0 projects to u,v ∝ 1/zc with
+        # position gradients ∝ 1/zc² — enormous. Densify-flung children land near the camera, Adam then blows
+        # their mean to ±inf → inf cx → NaN loss (the divergence we chased). zc>1e-4 admitted them; instead cull
+        # anything closer than near_frac × the typical (median) scene depth. Frozen near splats are harmless.
+        _zpos = zc[zc > 1e-4]
+        _near = max(1e-3, self.near_frac * float(np.median(_zpos))) if _zpos.size else 1e-3
+        valid = zc > _near
         vidx = np.nonzero(valid)[0]
         img = np.zeros((H, W, 3), np.float64)
         grads2d = {k: np.zeros(N, np.float64) for k in _GEOM}
@@ -153,13 +185,31 @@ class DeviceResidentTrainer:
                                           colv, Wp, Hp, want_T=True)
             img = np.clip(np.stack(chans, axis=-1)[:H, :W, :], 0.0, 1.0)
             _sync(dev); t3 = time.perf_counter(); self.timings["raster"] += t3 - t2
-            # ===== loss (L1 + D-SSIM) + dL/dimage (host, via autograd) =====
-            from loss import dloss_dimage
+            # ===== loss (L1 + D-SSIM) + dL/dimage — ON DEVICE (matmul-blur SSIM) when enabled & unmasked =====
             mk = (mask.detach().cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)) \
                 if mask is not None else None
-            loss, gi = dloss_dimage(img, gt, mk, self.lambda_dssim)
+            if self.dssim_dev is not None and mk is None:        # device SSIM (no host autograd; ~2.6x faster @1600px)
+                loss, gi = self.dssim_dev.loss_grad(img, gt, self.lambda_dssim)
+            else:                                                # host autograd path (always; + masked frames)
+                from loss import dloss_dimage
+                loss, gi = dloss_dimage(img, gt, mk, self.lambda_dssim)
             gp = np.zeros((Hp, Wp, 3), np.float64); gp[:H, :W, :] = gi
             t4 = time.perf_counter(); self.timings["loss"] += t4 - t3
+
+            # ===== #3 SKIP-STEP: a non-finite loss means this step's FORWARD is poisoned. Skip the whole
+            # backward+Adam so no garbage update lands; params stay as-is and the next camera usually recovers.
+            # Patience-bounded so a genuinely stuck run still terminates (vs spinning forever). =====
+            if self.skip_on_nan and not np.isfinite(loss):
+                self._skips += 1
+                self.last_screen = None                 # don't feed a poisoned pose/densify signal
+                self.nstep += 1
+                self.step_log.append(dict(B=1e3 * (t1 - t0), bin=1e3 * (t2 - t1), raster=1e3 * (t3 - t2),
+                                          loss=1e3 * (t4 - t3), A=0.0, D=0.0, C=0.0,
+                                          step=1e3 * (t4 - t0), skipped=1))
+                print(f"  [skip-step @{self.nstep}] non-finite loss — backward/Adam skipped "
+                      f"({self._skips}/{self.skip_patience} in a row)", flush=True)
+                return loss, img.astype(np.float32)     # params UNCHANGED this step
+            self._skips = 0                             # finite step → reset the patience counter
 
             # ===== A: raster backward (grid-sharded; tile-block loop when >352px) =====
             if blocked:
@@ -181,6 +231,11 @@ class DeviceResidentTrainer:
             loss = float((img - gt).__pow__(2).mean())
             t5 = time.perf_counter()
 
+        if self.grad_clip > 0:                             # GRADIENT CLIP — the fix the --debug telemetry pinpointed: a
+            for _k in grads2d:                             # split child's 2D conic-grad explodes (~1e4 vs ~1e-3) and Stage D
+                grads2d[_k] = np.clip(np.nan_to_num(grads2d[_k]), -self.grad_clip, self.grad_clip)   # project_backward → NaN. Bound it finite.
+        if self._gpos.shape[0] != N:                       # defensive: never let a stale densify-signal size hard-crash a run
+            self._gpos = np.zeros(N, dtype=np.float64); self._gacc = 0
         self._gpos += np.sqrt(grads2d["cx"] ** 2 + grads2d["cy"] ** 2)   # densify signal: screen-space ‖∂L/∂(u,v)‖
         self._gacc += 1
         # cache per-Gaussian screen state for host-side camera pose-opt (recipe gap #1): dL/du=cx, dL/dv=cy
@@ -191,12 +246,20 @@ class DeviceResidentTrainer:
                   op=grads2d["op"], colR=col_g[0], colG=col_g[1], colB=col_g[2])
         Pd = dict(mean=p["mean"], scale=p["scale"], quat=p["quat"], sh=p["sh"], op=p["op"], deg=self.deg_eff)
         _dbg("D: project_backward...")
-        g3 = project_backward(dev, Pd, cam, up, aux=(Ageo, Acol), return_ttnn=True)  # grads stay resident
+        g3 = project_backward(dev, Pd, cam, up, aux=(Ageo, Acol), return_ttnn=True,
+                              sanitize=self.proj_sanitize)  # #1 source-side floors when enabled; grads stay resident
         self.last_g3 = g3                                  # ttnn; grad-equivalence gate reads via to_torch
         _sync(dev); t6 = time.perf_counter(); self.timings["D"] += t6 - t5
         # ===== C: device Adam (resident grads -> NO host round-trip) =====
         _dbg("C: adam.step...")
-        self.adam.step({k: g3[k] for k in ("mean", "scale", "quat", "op", "sh")})
+        _gin = {k: g3[k] for k in ("mean", "scale", "quat", "op", "sh")}
+        if self.grad_clip > 0 or self.proj_sanitize:       # SANITIZE 3D grads — THE net: project_backward can emit NaN/inf
+            _C = self.grad_clip if self.grad_clip > 0 else 1e30   # from degenerate split-child geometry. #1's on-device floors
+            _gin = {k: torch.nan_to_num(ttnn.to_torch(v), nan=0.0, posinf=_C, neginf=-_C).clamp(-_C, _C)   # bound inf; this host
+                    for k, v in _gin.items()}              # nan_to_num kills any residual NaN → params stay finite. (TT_GRAD_CLIP=0 off)
+        self.adam.step(_gin)
+        if self.scale_lo is not None:                      # anti-degenerate scale band — bounds the conic so a
+            self.adam.clamp_param("scale", min_val=self.scale_lo, max_val=self.scale_hi)   # tiny splat can't explode grads
         _sync(dev); t7 = time.perf_counter(); self.timings["C"] += t7 - t6
         self.timings["step"] += t7 - t0
         self.nstep += 1
@@ -211,7 +274,34 @@ class DeviceResidentTrainer:
             except Exception:
                 pass
         self.step_log.append(_log)
+        if self.debug:                                     # --debug numerical-stability triage: flag the FIRST
+            p = self._p                                    # non-finite quantity in pipeline order so divergence is sourced
+            pl, pb = self._finite({"mean": p["mean"], "scale": p["scale"], "op": p["op"]})
+            g3l, g3b = self._finite({k: g3[k] for k in ("mean", "scale", "op")})
+            if vidx.size:
+                vl, vb = self._finite({"u": u[valid], "zc": zc[valid], "conic": np.stack([ca[valid], cb[valid], cc[valid]])})
+                zf = zc[valid]; zf = zf[np.isfinite(zf)]
+                proj = (f"zc_min={zf.min():.1e} " if zf.size else "") + vl
+                g2l, g2b = self._finite({"d_uv": np.stack([grads2d['cx'], grads2d['cy']]),
+                                         "d_conic": np.stack([grads2d['a'], grads2d['b'], grads2d['c']])})
+            else:
+                proj, vb, g2l, g2b = "(nothing visible)", None, "-", None
+            first = vb or g2b or g3b or pb                 # proj→2D grad→3D grad→param(after Adam); earliest = the source
+            print(f"  [dbg @{self.nstep}] vis={vidx.size}/{N} | proj {proj} | grad2d {g2l} | grad3d {g3l} | param {pl}"
+                  + (f"  ⚠FIRST-NONFINITE={first}" if first else "  ✓"), flush=True)
         return loss, img.astype(np.float32)
+
+    def _finite(self, arrs):
+        """--debug telemetry: arrs = {name: np.ndarray | ttnn.Tensor}. Returns ('name=|max| …', first-non-finite name|None)."""
+        out, bad = [], None
+        for k, v in arrs.items():
+            a = ttnn.to_torch(v).float().numpy() if isinstance(v, ttnn.Tensor) else np.asarray(v)
+            fin = np.isfinite(a)
+            if fin.all():
+                out.append(f"{k}={np.abs(a).max():.1e}")
+            else:
+                out.append(f"{k}=NaN/inf×{int((~fin).sum())}"); bad = bad or k
+        return " ".join(out), bad
 
     def params_host(self):
         """Read resident params back to host torch (for PLY export / checkpoint — NOT per inner step)."""
@@ -237,6 +327,7 @@ class DeviceResidentTrainer:
             return self.N                       # refuse a prune that would empty or change nothing
         self.adam.prune(keep)
         self.N = nkeep
+        self._gpos = np.zeros(self.N, dtype=np.float64); self._gacc = 0   # densify signal must track N (like cull/densify/spawn)
         return nkeep
 
     def reset_opacities(self, prob=0.01):
@@ -255,7 +346,18 @@ class DeviceResidentTrainer:
         from densify import densify_3d
         Ph = self.params_host()                                   # torch dict mean/scale/quat/op/sh + deg
         g = torch.from_numpy(self._gpos / max(self._gacc, 1)).float()
-        newP, st = densify_3d(Ph, g, grad_threshold=grad_threshold, n_max=n_max)
+        _msl = {"min_log_scale": self.scale_lo} if self.scale_lo is not None else {}   # split floor = scene band
+        _guard = os.environ.get("TT_DENSIFY_GUARD", "1") == "1"   # #2: prune collapsed splats + unit-quat children (default ON)
+        newP, st = densify_3d(Ph, g, grad_threshold=grad_threshold, n_max=n_max, guard=_guard, **_msl)
+        # NO-OP SHORT-CIRCUIT: when densify changes nothing (no grad signal, or the DIVERGENCE bail), do NOT
+        # rebuild the DeviceAdam. A rebuild wipes m/v momentum and (t kept large, m/v=0) jolts EVERY param by
+        # ~lr·sign(g) on the next step — so a no-op densify every `densify_every` steps was silently thrashing
+        # training. Keep Adam state intact; just refresh the grad-signal window and report why it no-op'd.
+        if st["n_after"] == st["n_before"] and not (st["clone"] or st["split"] or st["prune"]):
+            st["reason"] = "diverged(params non-finite)" if st.get("diverged") else \
+                           f"no grad signal (gmax={float(g.max()) if g.numel() else 0.0:.2e}, gacc={self._gacc})"
+            self._gpos = np.zeros(self.N, dtype=np.float64); self._gacc = 0
+            return st
         init = {k: newP[k].detach() for k in ("mean", "scale", "quat", "op", "sh")}
         t_keep = self.adam.t
         self.adam = DeviceAdam(self.dev, init, self.adam.lr, self.adam.b1, self.adam.b2, self.adam.eps)

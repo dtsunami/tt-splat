@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ttgs — pose-opt</title>
+  <link rel="icon" href="/favicon.ico">
+  <link rel="stylesheet" href="/static/base.css">
+  <style>
+    #main { display: flex; flex: 1; overflow: hidden; }
+    #pose-center { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+    #preview-row { flex: 0 0 34%; }
+    #scene-wrap { flex: 1; position: relative; background: #07090d; min-height: 0; border-top: 1px solid #2a2a2a; }
+    #scene-canvas { width: 100%; height: 100%; display: block; }
+    #scene-hud { position: absolute; left: 10px; top: 8px; font: 11px/1.5 monospace; color: #8aa; pointer-events: none; }
+    #scene-hud b { color: #fb4; }
+    #scrub-bar { position: absolute; left: 0; right: 0; bottom: 0; padding: 7px 12px; background: rgba(10,12,16,.82);
+                 border-top: 1px solid #243; font: 11px/1.4 monospace; color: #9bd; display: flex; align-items: center; gap: 10px; }
+    #scrub-bar input[type=range] { flex: 1; }
+    #scrub-bar .scrub-lbl { color: #fb4; min-width: 130px; }
+    #pose-side { width: 300px; background: #141414; border-left: 1px solid #282828; overflow-y: auto; flex-shrink: 0; }
+    .corr-big { display: flex; gap: 10px; padding: 10px; }
+    .corr-stat { flex: 1; background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 6px; padding: 8px 10px; }
+    .corr-stat .k { color: #888; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
+    .corr-stat .v { color: #fb4; font-size: 20px; font-weight: bold; font-family: monospace; }
+    .pose-help { color: #888; font-size: 11px; line-height: 1.5; padding: 0 10px 10px; }
+    .pose-help b { color: #fb4; }
+    .drive-big { width: calc(100% - 20px); margin: 10px; padding: 10px; font-size: 14px; }
+    .drive-big.on { background: #2a2317; border-color: #fb4; color: #fb4; }
+    #cam-list { padding: 0 10px 8px; font: 11px/1.5 monospace; max-height: 150px; overflow-y: auto; }
+    .cam-row { display: flex; justify-content: space-between; padding: 2px 6px; border-radius: 4px; cursor: pointer; color: #9ab; }
+    .cam-row:hover { background: #1c1c1c; } .cam-row.foc { background: #2a2317; color: #fb4; }
+    .gizmo-seg { cursor: pointer; padding: 1px 8px; border-radius: 8px; border: 1px solid #333; color: #aaa; }
+    .gizmo-seg.sel { background: #15351a; border-color: #4f8; color: #7de08a; }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <a href="/"><b>ttgs</b></a> <span class="sep">|</span>
+  <a href="/training">training</a> <span class="sep">|</span>
+  <b>🎮 pose-opt</b> <span class="sep">|</span>
+  <a href="/densify">🌱 densify</a> <span class="sep">|</span>
+  <a href="/docs/controls.html" target="_blank" title="Every control & knob, explained">🎛️ controls</a>
+  <span class="spacer"></span>
+  <span class="poll-status" id="poll-status">waiting...</span>
+</div>
+
+<div class="run-bar" id="run-bar"></div>
+
+<div id="main">
+  <div id="pose-center">
+    <!-- render / GT / diff: SEE the ghosting that pose-opt fixes -->
+    <div id="preview-row">
+      <div class="preview-cell" id="render-cell">
+        <div class="preview-label"><b>Render</b> <span class="muted small" id="pose-cam">--</span>
+          <span class="spacer"></span>
+          <span class="splat-bar" id="drive-bar" title="WASD = move, Q/E = down/up, Z/C = roll, drag = look. Nudges the CURRENT camera; enables pose-opt.">
+            <span class="splat-btn" id="drive-toggle" onclick="driveToggle()">🎮 Drive</span>
+          </span>
+        </div>
+        <div class="no-data" id="render-ph">waiting for training…</div>
+        <img id="render-img" />
+        <canvas id="splat-overlay"></canvas>
+        <div id="pose-hud"></div>
+      </div>
+      <div class="preview-cell">
+        <div class="preview-label"><b>Ground Truth</b></div>
+        <div class="no-data" id="gt-ph">--</div>
+        <img id="gt-img" />
+      </div>
+      <div class="preview-cell">
+        <div class="preview-label"><b>Diff</b> <span class="muted small">ghosting = pose error</span></div>
+        <div class="no-data" id="diff-ph">--</div>
+        <img id="diff-img" />
+      </div>
+    </div>
+
+    <!-- 3D camera scene: frustums + gaussian cloud + SO(3) flags + the scroll-wheel flag-history scrubber -->
+    <div id="scene-wrap">
+      <canvas id="scene-canvas"></canvas>
+      <div id="scene-hud">drag = orbit · <b>scroll = scrub flag history</b> · click a camera to focus</div>
+      <div id="scrub-bar">
+        <span>🚩 flag history</span>
+        <input type="range" id="scrub" min="0" max="0" value="0" step="1" oninput="scrubTo(+this.value)">
+        <span class="scrub-lbl" id="scrub-lbl">live</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- right: pose-opt controls + readout -->
+  <div id="pose-side">
+    <div class="ctrl-section"><h3>Current camera correction</h3></div>
+    <div class="corr-big">
+      <div class="corr-stat"><div class="k">Δ rotation</div><div class="v" id="corr-rot">--</div></div>
+      <div class="corr-stat"><div class="k">Δ translation</div><div class="v" id="corr-trn">--</div></div>
+    </div>
+
+    <div class="ctrl-section"><h3>Cameras</h3></div>
+    <div id="cam-list"><span class="muted small">waiting for training…</span></div>
+
+    <div class="ctrl-section"><h3>Edit the focused pose</h3></div>
+    <div style="padding:0 10px 6px;font-size:11px;color:#889">3D gizmo:
+      <span class="gizmo-seg sel" id="giz-rot" onclick="setGizmo('rotate')">rotate (ω)</span>
+      <span class="gizmo-seg" id="giz-trn" onclick="setGizmo('translate')">move (t)</span>
+      <span class="gizmo-seg" id="giz-off" onclick="setGizmo('off')">off</span>
+    </div>
+    <button class="ctrl-lg drive-big" id="drive-toggle2" onclick="driveToggle()">🎮 Drive (WASD + mouse)</button>
+    <div class="ctrl-field" style="padding:0 10px">
+      <label data-tip-title="Nudge step" data-tip="Per-click / drive / gizmo magnitude. ω in radians, t in world units.">nudge step <span class="ctrl-value" id="pose-step-val">0.010</span></label>
+      <input type="range" id="pose-step" min="0.001" max="0.1" step="0.001" value="0.01"
+             oninput="document.getElementById('pose-step-val').textContent=parseFloat(this.value).toFixed(3)">
+    </div>
+    <div class="pose-grid" id="pose-pad" style="padding:0 10px 10px"></div>
+
+    <div class="pose-help">
+      <b>Pose-opt</b> makes the extrinsics trainable to absorb COLMAP error (ghosting / double images). The 3D
+      scene shows every camera's <b>SO(3) flag</b> (x=red, y=green, z=blue) against the gaussian cloud. For the
+      focused camera the <b>dim</b> flag is the original COLMAP pose, the <b>bright</b> one is the current
+      correction — <b>scroll</b> to scrub the whole history between them.
+    </div>
+  </div>
+</div>
+
+<script src="/static/vendor/three.min.js"></script>
+<script src="/static/vendor/OrbitControls.js"></script>
+<script src="/static/vendor/TransformControls.js"></script>
+<script src="/static/base.js"></script>
+<script src="/static/components.js"></script>
+<script src="/static/drive.js"></script>
+<script src="/static/pose3d.js"></script>
+<script>
+  const ps = document.getElementById('poll-status');
+  if (typeof initRunBar === 'function') initRunBar('run-bar');
+  if (typeof initTooltips === 'function') initTooltips();
+
+  // 6-DoF nudge pad (reuses poseNudge from base.js)
+  (function buildPad(){
+    const pad=document.getElementById('pose-pad'); if(!pad) return;
+    const ax=['x','y','z']; let h='';
+    [['omega','ω'],['trans','t']].forEach(([kind,sym])=>{
+      for(let a=0;a<3;a++){
+        h+=`<span class="pose-lbl">${sym}${ax[a]}</span>`;
+        h+=`<button class="pose-btn" onclick="poseNudge('${kind}',${a},-1)">−</button>`;
+        h+=`<button class="pose-btn" onclick="poseNudge('${kind}',${a},1)">+</button>`;
+      }
+    });
+    pad.innerHTML=h;
+  })();
+
+  if (typeof initPose3D === 'function') initPose3D();   // boots the three.js scene (pose3d.js)
+
+  let _tick=0;
+  async function tick(){
+    try{
+      const d=await pollState();
+      try{ if(typeof updateRunBar==='function') updateRunBar(d); }catch(e){}
+      if(d){
+        ps.textContent='live'; ps.className='poll-status ok';
+        if(typeof setImg==='function'){ setImg('render-img','render-ph',d.render_b64); setImg('gt-img','gt-ph',d.gt_b64); setImg('diff-img','diff-ph',d.diff_b64); }
+        document.getElementById('pose-cam').textContent='· '+(d.camera_name||'--');
+        if(typeof _updatePoseHud==='function') _updatePoseHud(d);
+        const pc=d.pose_corr;
+        document.getElementById('corr-rot').textContent = pc ? pc.dw_deg.toFixed(3)+'°' : '0.000°';
+        document.getElementById('corr-trn').textContent = pc ? pc.dt.toFixed(4) : '0.0000';
+      } else { ps.textContent='idle'; ps.className='poll-status'; }
+      if(typeof pose3dPoll==='function' && ++_tick%3===0) pose3dPoll();   // refresh cameras / cloud / corrections
+    }catch(e){ console.warn('tick:',e); }
+  }
+  tick(); setInterval(tick,500);
+</script>
+</body>
+</html>

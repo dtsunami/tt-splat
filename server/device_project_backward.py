@@ -10,10 +10,20 @@ Math mirrors scratchpad/proto_proj_bwd.py, which is grad-checked vs torch autogr
 Golden = torch autograd of train_real.project_general/sh_eval.  Device target (fp32): rel err < ~1e-2.
 """
 from __future__ import annotations
+import os
 import torch
 import ttnn
 from backend import DEFAULT
 from device_project import project_geom, project_color, project_op, _dt, _shcol, _C0, _C1, _C2, _C3
+
+# ── #1 source-side anti-NaN floors (gated by sanitize=, off by default) ──────────────────────
+# The --debug telemetry localized the divergence to THIS stage: finite 2D grads + finite params
+# produce NaN/inf in dL/d{mean,scale} (degenerate densified children: 1/det blows up, exp(2·scale)
+# underflows, inf·0 → NaN). These bound the divide/overflow sites so the NaN never forms; the host
+# nan_to_num at device_resident.py keeps params finite as the final net.
+_DI_MAX    = float(os.environ.get("TT_DI_MAX", "1e7"))       # clamp 1/det before squaring (kills di²·cov² fp32 overflow)
+_GCLAMP    = float(os.environ.get("TT_PROJ_GCLAMP", "1e4"))  # bound the assembled 3D grads (inf → finite)
+_QNORM_EPS = float(os.environ.get("TT_QNORM_EPS", "1e-6"))   # floor |quat| before recip (zero-quat child → inf)
 
 
 def _t2t(dev, t):                       # torch/numpy [N] -> ttnn [N]
@@ -115,7 +125,7 @@ def _color_op_backward(B, shcol, up, AC, op_sig, deg):
     return gop, gsh_t, gmean_color
 
 
-def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None):
+def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None, sanitize=False):
     """P: dict with mean,scale,quat,op,sh (host torch OR device-resident ttnn), deg.
     cam: (Rv,tv,fx,fy,cx,cy).  up: dict of upstream grads u,v,ca,cb,cc,op,colR,colG,colB (host torch [N]).
     aux: optional (A_geom, A_color) from the Stage B forward (aux=True) — pass to SKIP the forward
@@ -156,6 +166,8 @@ def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None)
 
     # ===== (3) conic -> Sig2 (a_,b_,c_) =====
     a_, b_, c_, di = A["a_"], A["b_"], A["c_"], A["di"]
+    if sanitize:                          # #1: bound 1/det so di²·cov² can't overflow fp32 → inf → NaN
+        di = B.clamp(di, 0.0, _DI_MAX)
     di2 = m(di, di)
     gca, gcb, gcc = U["ca"], U["cb"], U["cc"]
     cc2 = m(c_, c_); aa2 = m(a_, a_); ac = m(a_, c_); bc = m(b_, c_); ab = m(a_, b_); bb = m(b_, b_)
@@ -263,7 +275,7 @@ def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None)
     for mq in range(4):
         t = m(gqn[mq], qnc[mq])
         dot = t if dot is None else ad(dot, t)
-    qninv = B.recip(A["qnorm"])
+    qninv = B.recip(B.clamp(A["qnorm"], _QNORM_EPS, 1e30) if sanitize else A["qnorm"])  # #1: zero-quat child → inf
     gquat_t = []
     for mq in range(4):
         proj = B.sub(gqn[mq], m(dot, qnc[mq]))
@@ -271,6 +283,11 @@ def project_backward(dev, P, cam, up, aux=None, return_ttnn=False, backend=None)
 
     # ===== mean total = geometry grad + color(dirs) grad (color part from _color_op_backward) =====
     gmean_t = [ad(gmean_geom[dmn], gmean_color[dmn]) for dmn in range(3)]
+
+    if sanitize:                          # #1: bound any inf that still slipped through (host nan_to_num kills NaN)
+        gmean_t  = [B.clamp(t, -_GCLAMP, _GCLAMP) for t in gmean_t]
+        gscale_t = [B.clamp(t, -_GCLAMP, _GCLAMP) for t in gscale_t]
+        gquat_t  = [B.clamp(t, -_GCLAMP, _GCLAMP) for t in gquat_t]
 
     if return_ttnn:                                       # DEVICE-RESIDENT grads -> device Adam, no round-trip
         return dict(

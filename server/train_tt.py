@@ -26,7 +26,7 @@ from loss import image_loss                                       # L1 + D-SSIM 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # vendored ttgs package
 from ttgs.viewer.dashboard import build_update
 
-HOST_MAX_POINTS = int(os.environ.get("TT_MAX_POINTS", "1200"))   # host-render budget
+HOST_MAX_POINTS = int(os.environ.get("TT_MAX_POINTS", "1200"))   # THE Gaussian-capacity knob: caps initial load AND densify growth (0 = unlimited)
 HOST_SIZE = int(os.environ.get("TT_SIZE", "96"))
 USE_DEVICE_RENDER = int(os.environ.get("TT_DEVICE_RENDER", "0"))  # render dashboard frame ON the Blackhole (M14)
 USE_DEVICE_TRAIN = int(os.environ.get("TT_DEVICE_TRAIN", "0"))    # fwd+bwd GRADIENTS on the Blackhole (Phase 2a)
@@ -117,6 +117,35 @@ def _write_ply(path: Path, P):
         f.write(("\n".join(hdr) + "\n").encode()); f.write(rows.tobytes())
 
 
+def _read_ply(path: Path):
+    """Inverse of _write_ply — load a 3DGS PLY back into a {mean,scale,quat,op,sh} param dict (for --resume)."""
+    with open(path, "rb") as f:
+        if f.readline().strip() != b"ply":
+            raise ValueError("not a PLY file")
+        props, N = [], 0
+        while True:
+            ln = f.readline().strip()
+            if ln == b"end_header" or not ln:
+                break
+            if ln.startswith(b"element vertex"):
+                N = int(ln.split()[-1])
+            elif ln.startswith(b"property float"):
+                props.append(ln.split()[-1].decode())
+        data = np.frombuffer(f.read(N * len(props) * 4), dtype="<f4").reshape(N, len(props))
+    col = {p: i for i, p in enumerate(props)}
+    nrest = sum(p.startswith("f_rest_") for p in props)
+    K = nrest // 3 + 1
+    g = lambda *names: torch.from_numpy(data[:, [col[n] for n in names]].copy())
+    sh = np.zeros((N, K, 3), np.float32)
+    sh[:, 0, :] = data[:, [col["f_dc_0"], col["f_dc_1"], col["f_dc_2"]]]
+    if nrest:                                                  # channel-major f_rest -> [N,K-1,3]
+        fr = data[:, [col[f"f_rest_{i}"] for i in range(nrest)]].reshape(N, 3, K - 1)
+        sh[:, 1:, :] = fr.transpose(0, 2, 1)
+    return {"mean": g("x", "y", "z"), "scale": g("scale_0", "scale_1", "scale_2"),
+            "quat": g("rot_0", "rot_1", "rot_2", "rot_3"), "op": g("opacity").reshape(-1),
+            "sh": torch.from_numpy(sh)}
+
+
 _LIVE_CFG_INT = ("iterations", "dashboard_every", "snapshot_every", "save_every",
                  "densify_from", "densify_until", "densify_every", "opacity_reset_every",
                  "pose_opt", "pose_opt_from",                   # #1 pose-opt enable + warm-up (live)
@@ -155,7 +184,11 @@ def _apply_config(cfg, cmd, dashboard=None):
 
 LR_DECAY = float(os.environ.get("TT_LR_DECAY", "0.01"))      # exp-decay the mean LR to this fraction over the run (>=1 = off)
 DENSIFY_ON = int(os.environ.get("TT_DENSIFY", "1"))          # adaptive clone/split/prune — cfg-driven (default ON)
-DENSIFY_MAX = int(os.environ.get("TT_DENSIFY_MAX", "100000"))  # hard cap on the Gaussian count
+# TT_MAX_POINTS (HOST_MAX_POINTS above) is the SINGLE capacity knob — it caps initial load AND densify growth,
+# so densify can never outgrow the device buffer. DENSIFY_MAX defaults to it; TT_DENSIFY_MAX may only lower it
+# (for tests), never exceed. HOST_MAX_POINTS==0 means unlimited.
+_cap = HOST_MAX_POINTS if HOST_MAX_POINTS else 10_000_000
+DENSIFY_MAX = min(int(os.environ.get("TT_DENSIFY_MAX", str(_cap))), _cap)  # hard cap on the Gaussian count
 
 # ---- gsplat training-recipe gaps (docs/RECIPE_GAPS_PLAN.md). All default to the prior behavior. ----
 # #1 pose-opt (gsplat pose_opt): now LIVE cfg fields (pose_opt / pose_opt_lr / pose_opt_reg / pose_opt_from)
@@ -282,6 +315,8 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
     if HOST_MAX_POINTS and xyz.shape[0] > HOST_MAX_POINTS:
         idx = torch.randperm(xyz.shape[0])[:HOST_MAX_POINTS]; xyz, rgb = xyz[idx], rgb[idx]
     _tgt = int(os.environ.get("TT_TARGET_POINTS", "0"))   # densify seed UP to N (jittered replication) for scale tests
+    if HOST_MAX_POINTS:                                    # single-knob: the seed can't exceed the capacity cap
+        _tgt = min(_tgt, HOST_MAX_POINTS)
     if _tgt > xyz.shape[0]:
         rep = (_tgt + xyz.shape[0] - 1) // xyz.shape[0]
         jit = torch.randn(xyz.shape[0] * rep, 3) * float(xyz.std(0).mean()) * 0.01
@@ -351,6 +386,17 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
     total = int(getattr(cfg, "iterations", 1000))
     focus = None; ply = output_dir / "splat.ply"
 
+    if resume and ply.exists():                              # --resume: reload the last checkpoint instead of the SfM init
+        try:
+            Pr = _read_ply(ply)
+            if all(torch.isfinite(Pr[k]).all() for k in ("mean", "scale", "quat", "op", "sh")):
+                P = {k: Pr[k].to(P[k].dtype) for k in Pr}
+                print(f"  [resume] loaded {P['mean'].shape[0]} Gaussians from {ply}", flush=True)
+            else:
+                print(f"  [resume] {ply} has non-finite params — ignoring, fresh SfM init", flush=True)
+        except Exception as e:
+            print(f"  [resume] failed to load {ply} ({type(e).__name__}: {e}); fresh SfM init", flush=True)
+
     if USE_DEVICE_RESIDENT:    # full device-resident loop: B/raster/A/D/C + Adam on the Blackhole, per-stage telemetry
         from render_device import _device
         from device_resident import DeviceResidentTrainer
@@ -361,6 +407,14 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
         ngauss = P["mean"].shape[0]
         print(f"device RESIDENT train: ON — B/raster/A/D/C + Adam on the Blackhole, params resident "
               f"({ngauss} Gaussians @ {HOST_SIZE}px); per-stage timings stream to the dashboard")
+        if dashboard is not None:                            # pose 3D view: push static base extrinsics+intrinsics once
+            _cp = []
+            for v in views:
+                _R = (v[0].detach().cpu().numpy() if torch.is_tensor(v[0]) else np.asarray(v[0])).reshape(-1)
+                _t = (v[1].detach().cpu().numpy() if torch.is_tensor(v[1]) else np.asarray(v[1])).reshape(-1)
+                _cp.append({"name": v[6], "R": _R.astype(float).tolist(), "t": _t.astype(float).tolist(),
+                            "fx": float(v[2]), "fy": float(v[3]), "cx": float(v[4]), "cy": float(v[5])})
+            dashboard.set_cameras(_cp)
         if SH_WARMUP > 0:
             print(f"progressive-SH warmup: ON — +1 band every {SH_WARMUP} steps up to deg {trainer.deg}")
         if AA_ON:
@@ -371,7 +425,17 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
         if DENSIFY_ON:
             print(f"densification ON (resident): from {_df} until {_du} every {_de}, cap {DENSIFY_MAX}, "
                   f"opacity-reset {_ore}")
+        if getattr(trainer, "scale_lo", None) is not None:        # anti-degenerate scale band (stops split→NaN)
+            print(f"scale band (anti-NaN): log-scale clamped to [{trainer.scale_lo:.2f}, {trainer.scale_hi:.2f}] "
+                  f"each step + split floor (TT_SCALE_BAND=0 to disable)")
+        _gd = os.environ.get("TT_DENSIFY_GUARD", "1") == "1"
+        print(f"anti-NaN guards: #1 project-bwd floors {'ON' if trainer.proj_sanitize else 'off'} (TT_PROJ_SANITIZE) · "
+              f"#2 densify guard {'ON' if _gd else 'off'} (TT_DENSIFY_GUARD) · "
+              f"#3 skip-step {'ON' if trainer.skip_on_nan else 'off'} (TT_SKIP_STEP, patience {trainer.skip_patience}) · "
+              f"checkpoint every {int(getattr(cfg, 'save_every', 0) or 0) or int(os.environ.get('TT_CKPT_EVERY','1000') or 0)} (--resume)")
         _lrm0 = trainer.adam.lr["mean"]                            # base mean LR for exp decay
+        if dashboard is not None:
+            dashboard.set_status("running", f"device-resident @ {HOST_SIZE}px")
         for step in range(1, total + 1):
             every = max(1, int(getattr(cfg, "dashboard_every", 25)))
             trainer.lambda_dssim = float(getattr(cfg, "lambda_dssim", 0.2) or 0.0)   # live D-SSIM weight
@@ -414,7 +478,9 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
                     elif t == "densify_now":
                         _st = trainer.densify(grad_threshold=_dgt, n_max=DENSIFY_MAX); ngauss = trainer.N
                         detail = f"clone={_st['clone']} split={_st['split']} prune={_st['prune']} -> {ngauss}"
+                        if _st.get('reason'): detail += f"  NO-OP: {_st['reason']} (Adam kept)"
                         print(f"  [resident densify_now] {detail}")
+                        dashboard.log_densify(_st, step)
                     elif t == "splat_spawn":                       # bubble gun
                         _ix = name2idx.get(cmd.get("camera_name"))
                         if _ix is not None and cmd.get("points"):
@@ -444,13 +510,31 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
                 gm = np.asarray(gmask, np.float64); mask = gm if mask is None else mask * gm
             cam_use = pose.corrected_cam(vi, cam) if pose is not None else cam   # #1 apply trainable extrinsics
             loss, img = trainer.step(cam_use, gt, mask)   # all param math on device; (loss, np[H,W,3])
+            if not math.isfinite(loss):                   # divergence guard
+                if getattr(trainer, "skip_on_nan", False):   # #3: skip the poisoned step, don't abort the run
+                    if trainer._skips >= trainer.skip_patience:
+                        msg = f"{trainer._skips} consecutive non-finite steps @{step} (N={trainer.N}) — gave up"
+                        print(f"  [DIVERGED] {msg}. Try raise densify 'every' or lower LR.", flush=True)
+                        if dashboard is not None:
+                            dashboard.set_status("diverged", msg); dashboard.log_event("diverged", msg, step)
+                        break
+                    if dashboard is not None:
+                        dashboard.log_event("skip", f"non-finite loss skipped ({trainer._skips}/{trainer.skip_patience})", step)
+                    continue                                 # params untouched (trainer skipped backward/Adam); next camera
+                msg = f"non-finite loss @{step} (N={trainer.N}) — params went NaN"
+                print(f"  [DIVERGED] {msg}. Densify likely too aggressive: raise 'every' or turn auto-densify off.", flush=True)
+                if dashboard is not None:
+                    dashboard.set_status("diverged", msg); dashboard.log_event("diverged", msg, step)
+                break
             if pose is not None and step >= _pose_from and trainer.last_screen is not None:
                 pose.resident_grad(vi, trainer.last_screen, cam_use)   # analytic dL/dδ from device 2D grads
                 pose.step()
             if DENSIFY_ON and _df <= step <= _du and step % _de == 0:
                 _st = trainer.densify(grad_threshold=_dgt, n_max=DENSIFY_MAX); ngauss = trainer.N
                 print(f"  [densify auto@{step}] clone={_st['clone']} split={_st['split']} "
-                      f"prune={_st['prune']} N {_st['n_before']}->{_st['n_after']}", flush=True)
+                      f"prune={_st['prune']} N {_st['n_before']}->{_st['n_after']}"
+                      + (f"  NO-OP: {_st['reason']} (Adam kept)" if _st.get('reason') else ""), flush=True)
+                if dashboard is not None: dashboard.log_densify(_st, step)
             if DENSIFY_ON and _ore > 0 and _df < step <= _du and step % _ore == 0:
                 trainer.reset_opacities()                    # safeguard: periodic floater cull
                 print(f"  [opacity reset @{step}]", flush=True)
@@ -467,10 +551,27 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
                     focus_camera=focus, l1=float(abs(r - g).mean()), mse=float(((r - g) ** 2).mean()),
                     psnr=psnr(torch.tensor(r), torch.tensor(g)), stage_timings=trainer.step_log[-1],
                     pose_corr=_pc))
+                if pose is not None:                         # flag scrubber: full per-camera 6-DoF δ trajectory
+                    dashboard.push_pose(step, pose.delta.detach().cpu().numpy().astype(float).tolist(), focus)
+                if step == 1 or step % max(every * 5, 100) == 0:   # 3D point cloud (subsampled; coarse cadence)
+                    _ph = trainer.params_host()
+                    _m = _ph["mean"].detach().cpu().numpy()
+                    _col = np.clip(_ph["sh"][:, 0, :].detach().cpu().numpy() * 0.2820948 + 0.5, 0, 1)
+                    _np = _m.shape[0]
+                    _ix = (np.random.choice(_np, 6000, replace=False) if _np > 6000 else np.arange(_np))
+                    dashboard.set_pointcloud(step, np.round(_m[_ix], 4).tolist(), np.round(_col[_ix], 3).tolist())
 
-            _sv = int(getattr(cfg, "save_every", 0) or 0)
-            if _sv > 0 and step % _sv == 0:
-                _write_ply(ply, trainer.params_host())
+            _sv = int(getattr(cfg, "save_every", 0) or 0) or int(os.environ.get("TT_CKPT_EVERY", "1000") or 0)
+            if _sv > 0 and step % _sv == 0:                  # resumable checkpoint (--resume reloads splat.ply)
+                _ph = trainer.params_host()
+                if torch.isfinite(_ph["mean"]).all() and torch.isfinite(_ph["scale"]).all():
+                    _write_ply(ply, _ph)                     # NaN-guard: never clobber a good checkpoint with garbage
+                    if dashboard is not None:
+                        dashboard.log_event("ckpt", f"checkpoint saved (N={trainer.N})", step)
+                else:
+                    print(f"  [ckpt @{step}] params non-finite — skipped (kept last good)", flush=True)
+                    if dashboard is not None:
+                        dashboard.log_event("ckpt", "checkpoint skipped — params non-finite", step)
         _write_ply(ply, trainer.params_host())
         if getattr(trainer, "profiler", None) is not None:
             trainer.profiler.close()                 # teardown: shrink the profiler CSV back to its header
@@ -540,6 +641,7 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
                         opt = make_opt(); gpos = torch.zeros(P["mean"].shape[0], dtype=torch.float64); gacc = 0
                         detail = f"clone={_st['clone']} split={_st['split']} prune={_st['prune']} -> {_st['n_after']}"
                         print(f"  [host densify_now] {detail}")
+                        dashboard.log_densify(_st, step)
                     elif t == "splat_spawn":                       # bubble gun
                         _ix = name2idx.get(cmd.get("camera_name"))
                         if _ix is not None and cmd.get("points"):
@@ -583,6 +685,11 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
         _lam = float(getattr(cfg, "lambda_dssim", 0.2) or 0.0)
         loss = image_loss(img, gt.to(img.dtype),                # L1 + D-SSIM (was pure MSE)
                           wmask.to(img.dtype) if wmask is not None else None, _lam)
+        if not torch.isfinite(loss):                            # divergence guard — stop CLEANLY (don't feed NaN onward)
+            print(f"  [DIVERGED] non-finite loss @step {step} (N={P['mean'].shape[0]}). Stopping — params went "
+                  f"NaN. Densify likely too aggressive: raise densify 'every' (try 200-500), keep grad=0, or "
+                  f"turn auto-densify off.", flush=True)
+            break
         opt.zero_grad()
         if pose_active: pose.zero_grad()                        # clear δ.grad before this step's backward
         loss.backward(); opt.step()
@@ -596,6 +703,7 @@ def run(dataset_dir, output_dir, cfg, backend, resume=False, viewer_port=None,
             gpos = torch.zeros(P["mean"].shape[0], dtype=torch.float64); gacc = 0
             print(f"  [densify auto@{step}] clone={_st['clone']} split={_st['split']} "
                   f"prune={_st['prune']} N {_st['n_before']}->{_st['n_after']}", flush=True)
+            if dashboard is not None: dashboard.log_densify(_st, step)
         if DENSIFY_ON and _ore > 0 and _df < step <= _du and step % _ore == 0:
             with torch.no_grad():
                 P["op"].fill_(float(torch.logit(torch.tensor(0.01))))   # safeguard: periodic floater cull
@@ -633,11 +741,12 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True); ap.add_argument("--output", default="work/tt_out")
     ap.add_argument("--steps", type=int, default=40)
+    ap.add_argument("--resume", action="store_true", help="reload output/splat.ply checkpoint instead of fresh SfM init")
     a = ap.parse_args()
     cfg = TrainConfig(); cfg.iterations = a.steps; cfg.dashboard_every = 10
     ctrl = TrainingController(output_dir=Path(a.output))
     # smoke: queue a prune mid-run to exercise the command path
-    out = run(Path(a.dataset), Path(a.output), cfg, backend=None, dashboard=ctrl)
+    out = run(Path(a.dataset), Path(a.output), cfg, backend=None, dashboard=ctrl, resume=a.resume)
     hist = ctrl.get_history()
     print(f"TRAIN_TT wrote {out} ; dashboard updates={len(hist)} ; "
           f"last={hist[-1].get('step') if hist else None}")

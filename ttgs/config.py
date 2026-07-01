@@ -42,7 +42,9 @@ class TrainConfig:
     densify_every: int = 100
     densify_from: int = 500
     densify_until: int = 15_000
-    densify_grad_threshold: float = 0.0002
+    densify_grad_threshold: float = 0.0   # 0 = ADAPTIVE (mean+std, scale-invariant). NOT gsplat's 0.0002:
+                                          # that's NDC-space; tt-splat's grad signal is pixel-space (~2/W
+                                          # smaller), so a fixed 0.0002 clones nothing. See densify.py.
     opacity_reset_every: int = 3_000
     densify: int = 1           # auto adaptive clone/split/prune on the from/until/every schedule (0=off, 1=on)
     pose_opt: int = 0          # #1 trainable camera extrinsics (gsplat pose_opt); 0=off, 1=on (live)
